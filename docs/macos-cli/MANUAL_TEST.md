@@ -52,24 +52,40 @@ Try these in order. Each step is safe to repeat.
 ./outline-cli connect --dry-run --key-file ~/.outline-key
 ```
 
-Expected: the key is shown redacted, the first-hop IP(s) are listed, and the connect and disconnect command lists match what you saw in M2. Nothing changes on the system.
+Expected: the key is shown redacted, the first-hop IP(s) are listed, and the connect list includes `route -n add -host <first hop IP> <your router>`. If macOS has a cached route for the server (it usually does right after the key is fetched), a `route -n delete -host <first hop IP>` comes just before it. Nothing changes on the system.
 
 ## 3. Connect and check
 
+Before connecting, save the routes that matter for the diagnosis:
+
 ```sh
-sudo ./outline-cli connect --key-file ~/.outline-key
+netstat -rn -f inet | grep -E '^default|^<first hop IP>' > /tmp/before-defaults.txt
 ```
 
-Expected: `the server is reachable`, then `connected: traffic goes through the tunnel (bound to en0)`.
+Then connect:
+
+```sh
+sudo ./outline-cli connect --key-file ~/.outline-key --log-level debug 2>&1 | tee /tmp/outline-cli.log
+```
+
+Expected, in order:
+1. `the server is reachable`
+2. `check 1/2 passed: the server is reachable with the tunnel routes in place`
+3. `check 2/2 passed: traffic flows through the tunnel`
+4. `connected: traffic goes through the tunnel (bound to en1)`
+
+These two checks run automatically once traffic is routed into the tunnel. If either fails, the CLI rolls every change back by itself and prints which check failed. Your network is then as before; no `cleanup` is needed.
+
+Note: **`ping` proves nothing here.** The CLI's network stack answers pings to any address itself, in under a millisecond. Use `curl` or `dig`.
 
 In the second terminal:
 
 | Check | Command | Expected |
 |---|---|---|
-| Public IP is the server's | `curl -4 -s https://ifconfig.me; echo` | The server's exit IP, not your normal one |
+| Public IP is the server's (no `ping`: see the note above) | `curl -4 -s https://ifconfig.me; echo` | The server's exit IP, not your normal one |
 | Tunnel routes | `netstat -rn -f inet \| grep utun` | `0/1`, `128.0/1` and `169.254.113.53` on a `utunN` |
 | **N5:** DNS address goes into the tunnel | `route -n get 169.254.113.53` | `interface: utunN` (not en0) |
-| Server route stays physical | `route -n get <first hop IP from the dry run>` | `interface: en0`, gateway = your router |
+| Server route stays physical | `route -n get <first hop IP from the dry run>` | `interface: en1` (your Wi-Fi), gateway = your router, **not** utunN |
 | DNS points at the tunnel | `scutil --dns \| grep -m2 nameserver` | `169.254.113.53` |
 | Names resolve | `dig +short example.com` | Addresses (answered through the tunnel) |
 | IPv6 is off on the service | `networksetup -getinfo Wi-Fi \| grep IPv6` | `IPv6: Off` |
@@ -118,6 +134,24 @@ While connected:
 - Only the primary service's DNS and IPv6 are changed. With several active interfaces the CLI warns that the others may leak.
 - A server given as a host name is resolved before connecting, using your normal DNS.
 
-## 8. What to send back
+## 8. If connect fails or traffic doesn't flow
+
+Send back:
+- `/tmp/outline-cli.log` (it is redacted, but check it before sending)
+- `/tmp/before-defaults.txt`
+
+If the session stays up but traffic fails, also run these in the second terminal while it is connected:
+
+```sh
+netstat -rn -f inet | grep -E '^default|^<first hop IP>|utun'
+route -n get <first hop IP>
+curl -4 -sv -m 10 http://1.1.1.1/ 2>&1 | tail -3         # TCP through the tunnel, no DNS needed
+dig +short +time=3 +tries=1 example.com @169.254.113.53  # DNS through the tunnel, UDP
+dig +short +time=3 +tries=1 +tcp example.com @169.254.113.53
+sudo tcpdump -ni en1 -c 10 host <first hop IP>            # run curl again meanwhile: do packets to the server leave on Wi-Fi?
+sudo tcpdump -ni utunN -c 10                              # and what enters the tunnel (utunN from the log)
+```
+
+## 9. What to send back
 
 For each step: pass or fail, and for failures the terminal output (use `--log-level debug`) plus the output of the check that failed. Mask anything you consider private (your public IP, network names).

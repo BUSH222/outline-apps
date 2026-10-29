@@ -109,3 +109,26 @@ Command: `PKG=./client/go/outline/electron NAME=outline-electron-m0 SMOKE_ARGS=-
 - Tests refuse every real socket by default, so they never send traffic out.
 - `go test -race` prints `ld: warning: ... malformed LC_DYSYMTAB` with the current Apple linker. This is a known, harmless linker warning for race builds.
 - Not handled yet: detecting a dead transport while connected (traffic stops until Ctrl-C).
+
+## 9. Manual test 1 (developer's Mac, 2026-10-30): traffic did not flow
+
+What was observed:
+- Connect and disconnect worked: the health checks passed, and DNS, IPv6 and routes were restored afterwards.
+- While connected, nothing worked: `dig` through `169.254.113.53` timed out and `curl` got no response.
+- `ping 1.1.1.1` answered in 0.36 ms with TTL 64. That reply comes from lwIP, which answers pings itself. So packets did pass between the utun and lwIP, but it says nothing about the server path.
+
+Verified so far:
+- **N5 holds:** `route -n get 169.254.113.53` showed `interface: utun4`.
+- The parsers read the real Mac correctly: service Wi-Fi on `en1`, gateway `192.168.1.254`, DHCP DNS, IPv6 Automatic.
+
+**Bug found:** the server's host route was never added. The dynamic key is fetched from the server's own IP, so macOS had a kernel-cloned cache route (`WASCLONED`) for it. `route -n get` reported that cache entry as an exact match, and the CLI skipped it as "a route someone else configured". While connected, the server's IP was routed to `utun4`.
+- **Fix:** cloned routes are recognized from the `flags` line, deleted, and replaced with the CLI's static host route.
+
+**Open question:** with the host route missing, did the bound sockets still fail? Or does `IP_BOUND_IF` on the primary interface not escape the utun's `/1` routes? That matters for M4, because bypass traffic relies on binding alone.
+
+**Added to answer it:**
+- A check after routing, with automatic rollback:
+  1. The transport reaches the server with the routes in place.
+  2. An ordinary connection (system DNS, default routes) works through the tunnel.
+  3. If 2 fails: does DNS at `169.254.113.53` answer?
+- Bound-dial failures are now logged with their reason.
