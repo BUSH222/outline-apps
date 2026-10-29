@@ -21,11 +21,18 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"log/slog"
+	"net/netip"
 	"os"
 	"strings"
+	"time"
 
 	"localhost/client/go/outline/macoscli/internal/keys"
 	"localhost/client/go/outline/macoscli/internal/redact"
+	"localhost/client/go/outline/macoscli/internal/state"
+	"localhost/client/go/outline/macoscli/internal/sysexec"
+	"localhost/client/go/outline/macoscli/internal/sysrouter"
+	"localhost/client/go/outline/macoscli/internal/tunnel"
 )
 
 type connectFlags struct {
@@ -64,7 +71,9 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	}
 	if !f.dryRun {
 		// Refuse before fetching anything, so a real connect never half-runs.
-		return notImplemented(e, "connect without --dry-run", "M2")
+		// It needs interface-bound sockets (M3); without them the transport's
+		// own traffic would loop into the tunnel.
+		return notImplemented(e, "connect without --dry-run", "M3")
 	}
 
 	fail := func(err error) int {
@@ -102,11 +111,75 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	if err != nil {
 		return fail(err)
 	}
+	hops, err := firstHopAddrs(ctx, parsed.Pair, e.lookup)
+	if err != nil {
+		return fail(err)
+	}
 
 	// Every line goes through the redactor as a last guard.
 	out := &redactingWriter{w: e.stdout, secrets: secrets}
-	printDryRun(out, raw, resolved, parsed, rules, rulesStatus)
+	printDryRun(out, raw, resolved, parsed, rules, rulesStatus, hops)
+	fmt.Fprintf(out, "  state file:      %s\n", describeStateFile(state.FileStore{Dir: e.stateDir}))
+	if err := printPlan(ctx, out, e, hops, logger); err != nil {
+		return fail(err)
+	}
 	return exitOK
+}
+
+// printPlan runs the connect and disconnect sequences against the dry-run
+// executor: read-only queries run for real, every change is only printed.
+func printPlan(ctx context.Context, out io.Writer, e env, hops []netip.Addr, logger *slog.Logger) error {
+	dry := &sysexec.DryRun{Next: e.exec, IsReadOnly: sysrouter.IsReadOnly, Out: out}
+	opts := tunnel.Options{
+		Router:  &sysrouter.Router{Exec: dry},
+		Store:   state.NewMemStore(nil),
+		OpenTUN: func() (tunnel.TUN, error) { return placeholderTUN{}, nil },
+		StartTransport: func(context.Context, tunnel.TUN) (func(), error) {
+			return func() {}, nil
+		},
+		FirstHops:     hops,
+		LocalPrefixes: e.localPrefixes,
+		// Only warnings are relevant in a dry run; "tunnel is up" would mislead.
+		Logger: slog.New(warnOnly{logger.Handler()}),
+	}
+	fmt.Fprintln(out, "  connect would run (utunN is the utun macOS assigns):")
+	session, err := tunnel.Up(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("planning the connection: %w", err)
+	}
+	fmt.Fprintln(out, "  disconnect would run:")
+	return session.Down(ctx)
+}
+
+// placeholderTUN stands in for the utun in a dry run.
+type placeholderTUN struct{}
+
+func (placeholderTUN) Read([]byte) (int, error)    { return 0, io.EOF }
+func (placeholderTUN) Write(p []byte) (int, error) { return len(p), nil }
+func (placeholderTUN) Close() error                { return nil }
+func (placeholderTUN) Name() string                { return "utunN" }
+
+// warnOnly drops records below Warn.
+type warnOnly struct{ slog.Handler }
+
+func (w warnOnly) Enabled(ctx context.Context, l slog.Level) bool {
+	return l >= slog.LevelWarn && w.Handler.Enabled(ctx, l)
+}
+
+// describeStateFile reports whether a previous session left state behind.
+func describeStateFile(store state.FileStore) string {
+	st, err := store.Load()
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return store.Path() + " (only readable by root; check with: sudo outline-cli cleanup --dry-run)"
+	case err != nil:
+		return fmt.Sprintf("%s (unreadable: %v)", store.Path(), err)
+	case st == nil:
+		return store.Path() + " (none; nothing to recover)"
+	default:
+		return fmt.Sprintf("%s (left by a session started %s; a real connect restores it first)",
+			store.Path(), st.StartedAt.Local().Format(time.DateTime))
+	}
 }
 
 // describeRulesFile says whether the rules file exists. A missing explicit
@@ -125,7 +198,7 @@ func describeRulesFile(loc rulesLocation) (string, error) {
 	}
 }
 
-func printDryRun(w io.Writer, raw *keys.RawKey, resolved *keys.Resolved, parsed *keys.Parsed, rules rulesLocation, rulesStatus string) {
+func printDryRun(w io.Writer, raw *keys.RawKey, resolved *keys.Resolved, parsed *keys.Parsed, rules rulesLocation, rulesStatus string, hops []netip.Addr) {
 	pair := parsed.Pair
 	firstHop := resolved.FirstHop
 	if firstHop == "" {
@@ -142,9 +215,13 @@ func printDryRun(w io.Writer, raw *keys.RawKey, resolved *keys.Resolved, parsed 
 	fmt.Fprintf(w, "  connection type: %s (TCP %s, UDP %s)\n", resolved.ConnectionType,
 		keys.ConnTypeName(pair.StreamDialer.ConnType), keys.ConnTypeName(pair.PacketRelay.ConnType))
 	fmt.Fprintf(w, "  first hop:       %s\n", firstHop)
+	hopIPs := make([]string, len(hops))
+	for i, h := range hops {
+		hopIPs[i] = h.String()
+	}
+	fmt.Fprintf(w, "  first hop IPs:   %s\n", orNone(strings.Join(hopIPs, ", ")))
 	fmt.Fprintf(w, "  usage reporter:  %s\n", reporter)
 	fmt.Fprintf(w, "  rules file:      %s (%s; %s)\n", rules.Path, rules.Origin, rulesStatus)
-	fmt.Fprintln(w, "  system changes:  none planned yet (the tunnel manager arrives in milestone M2)")
 }
 
 func orNone(s string) string {

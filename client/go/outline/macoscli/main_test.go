@@ -21,11 +21,14 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"localhost/client/go/outline/macoscli/internal/fakemac"
 
 	"github.com/stretchr/testify/require"
 )
@@ -71,6 +74,22 @@ func runCLI(t *testing.T, e env, args ...string) result {
 	if e.lookupUser == nil {
 		e.lookupUser = func(string) (*user.User, error) { return nil, errors.New("no user database in tests") }
 	}
+	// Tests never run real system commands.
+	if e.exec == nil {
+		e.exec = fakemac.New().Executor()
+	}
+	if e.stateDir == "" {
+		e.stateDir = t.TempDir()
+	}
+	if e.geteuid == nil {
+		e.geteuid = func() int { return 501 }
+	}
+	if e.localPrefixes == nil {
+		e.localPrefixes = func() ([]netip.Prefix, error) { return nil, nil }
+	}
+	if e.lookup == nil {
+		e.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no DNS in tests") }
+	}
 	code := run(context.Background(), args, e)
 	return result{code, stdout.String(), stderr.String()}
 }
@@ -100,7 +119,7 @@ func TestUsage(t *testing.T) {
 }
 
 func TestNotImplementedCommands(t *testing.T) {
-	for _, cmd := range []string{"cleanup", "lockdown", "unlock"} {
+	for _, cmd := range []string{"lockdown", "unlock"} {
 		r := runCLI(t, env{}, cmd)
 		require.Equal(t, exitError, r.code, cmd)
 		require.Contains(t, r.stderr, "not implemented yet")

@@ -22,6 +22,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"os/user"
@@ -29,6 +30,8 @@ import (
 	"syscall"
 
 	"localhost/client/go/outline/macoscli/internal/redact"
+	"localhost/client/go/outline/macoscli/internal/state"
+	"localhost/client/go/outline/macoscli/internal/sysexec"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -45,7 +48,7 @@ const usage = `outline-cli: an Outline VPN client for macOS without a Network Ex
 Usage:
   sudo outline-cli connect  --key-file PATH | --key KEY   [--rules PATH] [--log-level LEVEL]
        outline-cli connect  ... --dry-run   resolve the key and print the plan; no root needed
-  sudo outline-cli cleanup                  restore routes, DNS and IPv6 from the state file
+  sudo outline-cli cleanup  [--dry-run]     restore routes, DNS and IPv6 from the state file
   sudo outline-cli lockdown                 install the VPN-only block rules (persistent)
   sudo outline-cli unlock                   remove the VPN-only block rules
        outline-cli version
@@ -58,14 +61,24 @@ most environment variables, so prefer --key-file (mode 0600), or run
 Run "outline-cli COMMAND -h" for a command's flags.
 `
 
-// env holds the process environment, so tests can replace it.
+// env holds the process environment, so tests can replace it. Tests always
+// use a simulated system executor, never the real one.
 type env struct {
 	stdout     io.Writer
 	stderr     io.Writer
 	getenv     func(string) string
 	lookupUser func(string) (*user.User, error)
+	geteuid    func() int
 	// httpTransport is used to fetch dynamic keys; nil means the default.
 	httpTransport http.RoundTripper
+	// exec runs system commands (route, networksetup, ...).
+	exec sysexec.Executor
+	// stateDir holds the state file and lock.
+	stateDir string
+	// lookup resolves the server name before any DNS change.
+	lookup lookupFunc
+	// localPrefixes lists local IPv4 networks; nil means the host's interfaces.
+	localPrefixes func() ([]netip.Prefix, error)
 }
 
 func main() {
@@ -76,6 +89,10 @@ func main() {
 		stderr:     os.Stderr,
 		getenv:     os.Getenv,
 		lookupUser: user.Lookup,
+		geteuid:    os.Geteuid,
+		exec:       sysexec.Real{},
+		stateDir:   state.DefaultDir,
+		lookup:     defaultLookup,
 	}))
 }
 
@@ -89,7 +106,7 @@ func run(ctx context.Context, args []string, e env) int {
 	case "connect":
 		return runConnect(ctx, rest, e)
 	case "cleanup":
-		return notImplemented(e, "cleanup", "M2")
+		return runCleanup(ctx, rest, e)
 	case "lockdown":
 		return notImplemented(e, "lockdown", "M5")
 	case "unlock":
