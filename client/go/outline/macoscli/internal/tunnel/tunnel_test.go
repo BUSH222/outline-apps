@@ -537,3 +537,58 @@ func TestUp_OnNetworkErrorAbortsBeforeAnyChange(t *testing.T) {
 	require.Empty(t, mutations(h.exec.Calls()))
 	h.requireRestored(t)
 }
+
+// Reproduces the first manual test: the dynamic key was fetched from the
+// server's own IP, so macOS had a cloned cache route for it, and the server's
+// host route was wrongly skipped as "already existing".
+func TestUp_ReplacesTheKernelsClonedRouteForTheServer(t *testing.T) {
+	h := newHarness(t, func(m *fakemac.Mac) {
+		m.AddClonedRoute(firstHop.String(), fakemac.WiFi.Gateway)
+	})
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+
+	m := mutations(h.exec.Calls())
+	del := indexOf(m, "route -n delete -host 100.200.0.10")
+	add := indexOf(m, "route -n add -host 100.200.0.10 192.168.1.1")
+	require.True(t, del >= 0 && add > del, "the cached route must be replaced by ours: %v", m)
+	route, ok := h.mac.HasRoute("100.200.0.10/32")
+	require.True(t, ok)
+	require.Equal(t, "192.168.1.1", route.Gateway.String())
+
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+	_, ok = h.mac.HasRoute("100.200.0.10/32")
+	require.False(t, ok, "our host route is removed; the cache entry is not restored")
+}
+
+func indexOf(list []string, s string) int {
+	for i, x := range list {
+		if x == s {
+			return i
+		}
+	}
+	return -1
+}
+
+func TestUp_FailedVerificationRollsEverythingBack(t *testing.T) {
+	h := newHarness(t)
+	verified := false
+	h.opts.Verify = func(context.Context) error {
+		// Called with everything in place.
+		route, ok := h.mac.HasRoute("0.0.0.0/1")
+		require.True(t, ok)
+		require.Equal(t, "utun7", route.Interface)
+		require.Equal(t, "169.254.113.53", h.mac.Snapshot().DNS["Wi-Fi"])
+		verified = true
+		return errors.New("DNS through the tunnel doesn't answer")
+	}
+	_, err := Up(context.Background(), h.opts)
+	require.True(t, verified)
+	require.ErrorContains(t, err, "every change was rolled back")
+	require.ErrorContains(t, err, "DNS through the tunnel doesn't answer")
+	require.True(t, h.tun.closed.Load())
+	require.True(t, h.stopped.Load())
+	h.requireRestored(t)
+}

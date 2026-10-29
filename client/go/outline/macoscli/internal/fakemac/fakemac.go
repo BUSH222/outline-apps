@@ -61,7 +61,8 @@ type Mac struct {
 	primary  *Network
 	others   []*Network
 	routes   map[netip.Prefix]sysrouter.RouteSpec
-	dns      map[string][]string // manual DNS; nil = DHCP
+	cloned   map[netip.Prefix]bool // kernel cache entries (WASCLONED)
+	dns      map[string][]string   // manual DNS; nil = DHCP
 	ipv6     map[string]sysrouter.IPv6Config
 	utuns    map[string]string
 	flushes  int
@@ -95,6 +96,7 @@ func New() *Mac {
 		services: []Service{WiFi.Service, Ethernet.Service},
 		primary:  &wifi,
 		routes:   map[netip.Prefix]sysrouter.RouteSpec{},
+		cloned:   map[netip.Prefix]bool{},
 		dns:      map[string][]string{},
 		ipv6: map[string]sysrouter.IPv6Config{
 			WiFi.Service.Name:     {Mode: sysrouter.IPv6Automatic, Raw: "Automatic"},
@@ -131,6 +133,17 @@ func (m *Mac) AddExistingRoute(r sysrouter.RouteSpec) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.routes[r.Dst] = r
+}
+
+// AddClonedRoute adds a kernel-cloned host route, as macOS creates for a
+// recently contacted host. Cloned routes are a cache and are left out of
+// snapshots.
+func (m *Mac) AddClonedRoute(host string, gateway netip.Addr) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	dst := netip.PrefixFrom(netip.MustParseAddr(host), 32)
+	m.routes[dst] = sysrouter.RouteSpec{Dst: dst, Gateway: gateway}
+	m.cloned[dst] = true
 }
 
 // SwitchTo makes n the primary network, as when joining another network.
@@ -186,8 +199,10 @@ func (m *Mac) Snapshot() Snapshot {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	s := Snapshot{DNS: map[string]string{}, IPv6: map[string]sysrouter.IPv6Config{}}
-	for _, r := range m.routes {
-		s.Routes = append(s.Routes, r.String())
+	for dst, r := range m.routes {
+		if !m.cloned[dst] {
+			s.Routes = append(s.Routes, r.String())
+		}
 	}
 	sort.Strings(s.Routes)
 	for _, svc := range m.services {
@@ -407,6 +422,11 @@ func (m *Mac) route(a []string) (string, string) {
 			if !r.Dst.IsSingleIP() {
 				out += "       mask: " + maskString(r.Dst.Bits()) + "\n"
 			}
+			if m.cloned[dst] {
+				out += "      flags: <UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE,IFREF>\n"
+			} else {
+				out += "      flags: <UP,DONE,STATIC>\n"
+			}
 			return out, ""
 		}
 		if m.primary == nil {
@@ -433,6 +453,7 @@ func (m *Mac) route(a []string) (string, string) {
 			return "", "route: writing to routing socket: not in table\ndelete net " + dst.String() + ": not in table\n"
 		}
 		delete(m.routes, dst)
+		delete(m.cloned, dst)
 		return "delete net " + dst.String() + "\n", ""
 	}
 	return "", "route: unsupported verb\n"

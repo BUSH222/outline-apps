@@ -90,6 +90,8 @@ type env struct {
 	startTransport startTransportFunc
 	// watchInterval is how often network changes are checked; 0 means 2 s.
 	watchInterval time.Duration
+	// verify builds the check that runs once traffic is routed into the tunnel.
+	verify verifyFunc
 }
 
 func main() {
@@ -109,6 +111,7 @@ func main() {
 		interfaceIndex: netbind.InterfaceIndex,
 		openTUN:        tunnel.OpenUTun,
 		startTransport: startRemoteDevice,
+		verify:         verifyTunnel,
 	}))
 }
 

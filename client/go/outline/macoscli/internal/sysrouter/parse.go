@@ -311,6 +311,9 @@ func parseIPv6Info(out string) (IPv6Config, error) {
 type routeGetResult struct {
 	destination netip.Addr
 	bits        int // -1 if no mask was printed (a host route)
+	// cloned is true for a route the kernel cloned (flag WASCLONED): a
+	// per-destination cache entry, not configuration.
+	cloned bool
 }
 
 // parseRouteGet parses `route -n get ...`.
@@ -348,6 +351,8 @@ func parseRouteGet(out string) (routeGetResult, error) {
 				return res, fmt.Errorf("unexpected mask %q in route output", value)
 			}
 			res.bits = maskBits(mask)
+		case "flags":
+			res.cloned = strings.Contains(value, "WASCLONED")
 		}
 	}
 	if !sawDest {

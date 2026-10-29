@@ -17,8 +17,10 @@ package netbind
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -212,4 +214,45 @@ func TestResolverDialsTheDirectServersInOrder(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, closedAddr.String(), uconn.RemoteAddr().String(), "UDP connect doesn't fail, so the first server is used")
 	uconn.Close()
+}
+
+func TestDialLogging(t *testing.T) {
+	b, _ := recordingBinder()
+	var buf syncLog
+	b.SetLogger(slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	require.NoError(t, b.SetInterface("en0"))
+	addr, _ := listenTCP(t)
+	c, err := b.StreamDialer().DialStream(ctx(t), addr)
+	require.NoError(t, err)
+	c.Close()
+	require.Contains(t, buf.String(), "bound connection opened")
+	require.Contains(t, buf.String(), "interface=en0")
+
+	closed, err := net.Listen("tcp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	closedAddr := closed.Addr().String()
+	closed.Close()
+	for i := 0; i < 3; i++ {
+		_, err = b.StreamDialer().DialStream(ctx(t), closedAddr)
+		require.Error(t, err)
+	}
+	require.Equal(t, 1, strings.Count(buf.String(), "level=WARN"), "failures warn at most once per interval")
+	require.Equal(t, 3, strings.Count(buf.String(), "a connection from the physical interface failed"))
+}
+
+type syncLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (s *syncLog) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncLog) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
 }

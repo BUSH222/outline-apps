@@ -110,7 +110,11 @@ type Options struct {
 	// after capturing them, before the transport starts (an error aborts the
 	// connect), and again after each network change.
 	OnNetwork func(route sysrouter.DefaultRoute, resolvers []netip.Addr) error
-	Logger    *slog.Logger
+	// Verify, if set, runs after routes and DNS point into the tunnel. If it
+	// fails, everything is rolled back and Up returns its error. It catches a
+	// tunnel that passed the health check but breaks once traffic is routed.
+	Verify func(ctx context.Context) error
+	Logger *slog.Logger
 }
 
 func (o *Options) logger() *slog.Logger {
@@ -239,6 +243,11 @@ func Up(ctx context.Context, opts Options) (_ *Session, err error) {
 	if err := r.FlushDNSCache(ctx); err != nil {
 		log.Warn("flushing the DNS cache failed", "err", err)
 	}
+	if opts.Verify != nil {
+		if err := opts.Verify(ctx); err != nil {
+			return nil, fmt.Errorf("the tunnel doesn't carry traffic, so every change was rolled back: %w", err)
+		}
+	}
 	log.Info("tunnel is up", "utun", tun.Name(), "network", primary.String(), "service", service)
 	return s, nil
 }
@@ -333,15 +342,26 @@ func containedIn(addr netip.Addr, prefixes []netip.Prefix) bool {
 // addRoute adds a route unless one for the same destination already exists
 // (then it isn't ours, and it is never recorded or removed). The route is
 // journaled before it is added, so a crash right after the add is undone.
+//
+// A kernel-cloned cache entry for the destination doesn't count as existing:
+// macOS creates one for every recently contacted host (for example the server
+// a dynamic key was just fetched from), and it would block the real route.
+// It is deleted first; it is never restored, since it is only a cache.
 func (s *Session) addRoute(ctx context.Context, route state.Route) error {
 	r := s.opts.Router
-	exists, err := r.RouteExists(ctx, route.Dst)
+	status, err := r.LookupRoute(ctx, route.Dst)
 	if err != nil {
 		return fmt.Errorf("checking route %s: %w", route.Dst, err)
 	}
-	if exists {
+	switch status {
+	case sysrouter.RoutePresent:
 		s.log.Debug("route already exists; leaving it alone", "route", route.Dst.String())
 		return nil
+	case sysrouter.RouteCloned:
+		s.log.Debug("replacing the kernel's cached route", "route", route.Dst.String())
+		if err := r.DeleteClonedRoute(ctx, route.Dst); err != nil {
+			return fmt.Errorf("deleting the cached route for %s: %w", route.Dst, err)
+		}
 	}
 	s.st.Routes = append(s.st.Routes, route)
 	if err := s.save(); err != nil {
@@ -354,6 +374,9 @@ func (s *Session) addRoute(ctx context.Context, route state.Route) error {
 	if !added {
 		// Someone else added it in the meantime: not ours.
 		s.st.Routes = s.st.Routes[:len(s.st.Routes)-1]
+		if route.Purpose == PurposeFirstHop {
+			s.log.Warn("the server's host route couldn't be added; relying on interface binding alone", "route", route.RouteSpec.String())
+		}
 		return s.save()
 	}
 	return nil

@@ -102,8 +102,10 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 			}
 			return nil
 		},
+		Verify: e.verify(pair, log),
 		Logger: log,
 	}
+	binder.SetLogger(log)
 
 	session, err := tunnel.Up(ctx, opts)
 	if err != nil {

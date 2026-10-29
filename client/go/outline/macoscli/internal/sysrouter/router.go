@@ -55,7 +55,8 @@ type SystemRouter interface {
 	SystemResolvers(ctx context.Context, iface string) ([]netip.Addr, error)
 	IPv6(ctx context.Context, service string) (IPv6Config, error)
 	ConfigureUTun(ctx context.Context, name string, local, peer netip.Addr) error
-	RouteExists(ctx context.Context, dst netip.Prefix) (bool, error)
+	LookupRoute(ctx context.Context, dst netip.Prefix) (RouteStatus, error)
+	DeleteClonedRoute(ctx context.Context, dst netip.Prefix) error
 	AddRoute(ctx context.Context, r RouteSpec) (added bool, err error)
 	DeleteRoute(ctx context.Context, r RouteSpec) error
 	SetDNS(ctx context.Context, service string, servers []string) error
@@ -150,20 +151,50 @@ func (r *Router) ConfigureUTun(ctx context.Context, name string, local, peer net
 	return err
 }
 
-// RouteExists reports whether a route for exactly dst is already in the table.
-func (r *Router) RouteExists(ctx context.Context, dst netip.Prefix) (bool, error) {
+// RouteStatus says whether a route for a destination is in the table.
+type RouteStatus int
+
+const (
+	// RouteAbsent: no route for exactly this destination.
+	RouteAbsent RouteStatus = iota
+	// RoutePresent: a configured route for exactly this destination.
+	RoutePresent
+	// RouteCloned: only a kernel-cloned cache entry for this host, which macOS
+	// creates for recently contacted destinations. It is not configuration and
+	// blocks adding a real route until deleted.
+	RouteCloned
+)
+
+// LookupRoute reports whether a route for exactly dst is already in the table.
+func (r *Router) LookupRoute(ctx context.Context, dst netip.Prefix) (RouteStatus, error) {
 	out, err := r.run(ctx, "route", append([]string{"-n", "get"}, destArgs(dst)...)...)
 	if err != nil {
 		if isNotInTable(out, err) {
-			return false, nil
+			return RouteAbsent, nil
 		}
-		return false, err
+		return RouteAbsent, err
 	}
 	res, err := parseRouteGet(out)
 	if err != nil {
-		return false, err
+		return RouteAbsent, err
 	}
-	return res.matches(dst), nil
+	switch {
+	case !res.matches(dst):
+		return RouteAbsent, nil
+	case res.cloned:
+		return RouteCloned, nil
+	default:
+		return RoutePresent, nil
+	}
+}
+
+// DeleteClonedRoute deletes a kernel-cloned route. A missing route is not an error.
+func (r *Router) DeleteClonedRoute(ctx context.Context, dst netip.Prefix) error {
+	out, err := r.run(ctx, "route", append([]string{"-n", "delete"}, destArgs(dst)...)...)
+	if err != nil && isNotInTable(out, err) {
+		return nil
+	}
+	return err
 }
 
 // AddRoute adds a route. added is false if the route already existed.

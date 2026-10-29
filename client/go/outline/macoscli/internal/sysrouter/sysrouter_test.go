@@ -353,28 +353,51 @@ func TestRouter_OtherRouteErrorsPropagate(t *testing.T) {
 	require.ErrorContains(t, r.DeleteRoute(context.Background(), RouteSpec{Dst: netip.MustParsePrefix("0.0.0.0/1"), Interface: "utun5"}), "must be root")
 }
 
-func TestRouter_RouteExists(t *testing.T) {
+func TestRouter_LookupRoute(t *testing.T) {
 	r, f := newRouter(func(c sysexec.Call) ([]byte, error) {
 		switch c.Args[len(c.Args)-1] {
 		case "169.254.0.0/16":
-			return []byte("destination: 169.254.0.0\n       mask: 255.255.0.0\n"), nil
+			return []byte("destination: 169.254.0.0\n       mask: 255.255.0.0\n      flags: <UP,DONE,CLONING,STATIC>\n"), nil
 		case "0.0.0.0/1":
 			return []byte("destination: default\n       mask: default\n"), nil
+		case "203.0.113.50":
+			// What macOS reports for a host contacted moments ago (for
+			// example the server a dynamic key was fetched from).
+			return []byte("   route to: 203.0.113.50\ndestination: 203.0.113.50\n    gateway: 192.168.1.254\n  interface: en1\n      flags: <UP,GATEWAY,HOST,DONE,WASCLONED,IFSCOPE,IFREF>\n"), nil
 		default:
 			return nil, cmdErr(c, "route: writing to routing socket: not in table\n")
 		}
 	})
 	ctx := context.Background()
-	ok, err := r.RouteExists(ctx, netip.MustParsePrefix("169.254.0.0/16"))
-	require.NoError(t, err)
-	require.True(t, ok)
-	ok, err = r.RouteExists(ctx, netip.MustParsePrefix("0.0.0.0/1"))
-	require.NoError(t, err)
-	require.False(t, ok)
-	ok, err = r.RouteExists(ctx, netip.MustParsePrefix("203.0.113.0/24"))
-	require.NoError(t, err)
-	require.False(t, ok)
-	require.Equal(t, "route -n get -net 169.254.0.0/16", f.Calls()[0].String())
+	for dst, want := range map[string]RouteStatus{
+		"169.254.0.0/16":     RoutePresent,
+		"0.0.0.0/1":          RouteAbsent,
+		"203.0.113.0/24":     RouteAbsent,
+		"203.0.113.50/32": RouteCloned,
+	} {
+		got, err := r.LookupRoute(ctx, netip.MustParsePrefix(dst))
+		require.NoError(t, err, dst)
+		require.Equal(t, want, got, dst)
+	}
+	var calls []string
+	for _, c := range f.Calls() {
+		calls = append(calls, c.String())
+	}
+	require.Contains(t, calls, "route -n get -net 169.254.0.0/16")
+	require.Contains(t, calls, "route -n get -host 203.0.113.50")
+}
+
+func TestRouter_DeleteClonedRoute(t *testing.T) {
+	r, f := newRouter(func(c sysexec.Call) ([]byte, error) {
+		if c.Args[len(c.Args)-1] == "203.0.113.9" {
+			return nil, cmdErr(c, "route: writing to routing socket: not in table\n")
+		}
+		return nil, nil
+	})
+	ctx := context.Background()
+	require.NoError(t, r.DeleteClonedRoute(ctx, netip.MustParsePrefix("203.0.113.50/32")))
+	require.NoError(t, r.DeleteClonedRoute(ctx, netip.MustParsePrefix("203.0.113.9/32")), "already gone is fine")
+	require.Equal(t, "route -n delete -host 203.0.113.50", f.Calls()[0].String())
 }
 
 func TestRouter_DNSAndIPv6Commands(t *testing.T) {

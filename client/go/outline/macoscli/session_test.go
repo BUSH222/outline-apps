@@ -173,3 +173,20 @@ func TestConnect_RefusesLoopingConfigBeforeChangingAnything(t *testing.T) {
 	require.Contains(t, r.stderr, "loop back into the tunnel")
 	require.Equal(t, baseline, mac.Snapshot())
 }
+
+func TestConnect_FailedVerificationRestoresTheNetwork(t *testing.T) {
+	mac := fakemac.New()
+	baseline := mac.Snapshot()
+	e, ctx := sessionEnv(t, mac)
+	e.verify = func(*configregistry.TransportPair, *slog.Logger) func(context.Context) error {
+		return func(context.Context) error {
+			return errors.New("check 2/2 failed: DNS at 169.254.113.53 doesn't answer")
+		}
+	}
+	r := runCLIContext(t, ctx, e, "connect", "--key", fakeSSKey)
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "every change was rolled back")
+	require.Contains(t, r.stderr, "169.254.113.53 doesn't answer")
+	require.NotContains(t, r.stdout, "connected:")
+	require.Equal(t, baseline, mac.Snapshot())
+}

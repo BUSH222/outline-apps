@@ -24,6 +24,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/netip"
 	"sync/atomic"
@@ -56,6 +57,35 @@ type Binder struct {
 	ifIndex   atomic.Int64
 	ifName    atomic.Pointer[string]
 	resolvers atomic.Pointer[[]netip.AddrPort]
+
+	log          atomic.Pointer[slog.Logger]
+	lastWarnNano atomic.Int64
+}
+
+// dialWarnInterval limits dial-failure warnings; the rest are logged at debug level.
+const dialWarnInterval = 5 * time.Second
+
+// SetLogger makes the Binder log its dials: failures as warnings (at most one
+// every 5 s), successes at debug level.
+func (b *Binder) SetLogger(l *slog.Logger) { b.log.Store(l) }
+
+func (b *Binder) logDial(network, addr string, conn net.Conn, err error) {
+	l := b.log.Load()
+	if l == nil {
+		return
+	}
+	iface, _ := b.Interface()
+	if err == nil {
+		l.Debug("bound connection opened", "network", network, "to", addr, "from", conn.LocalAddr().String(), "interface", iface)
+		return
+	}
+	now := time.Now().UnixNano()
+	last := b.lastWarnNano.Load()
+	if now-last >= int64(dialWarnInterval) && b.lastWarnNano.CompareAndSwap(last, now) {
+		l.Warn("a connection from the physical interface failed", "network", network, "to", addr, "interface", iface, "err", err)
+		return
+	}
+	l.Debug("a connection from the physical interface failed", "network", network, "to", addr, "interface", iface, "err", err)
 }
 
 // PlatformBind binds a socket with the platform's mechanism (IP_BOUND_IF on
@@ -157,6 +187,7 @@ func (b *Binder) dialer() *net.Dialer {
 func (b *Binder) StreamDialer() transport.StreamDialer {
 	return transport.FuncStreamDialer(func(ctx context.Context, addr string) (transport.StreamConn, error) {
 		conn, err := b.dialer().DialContext(ctx, "tcp4", addr)
+		b.logDial("tcp4", addr, conn, err)
 		if err != nil {
 			return nil, err
 		}
@@ -167,7 +198,9 @@ func (b *Binder) StreamDialer() transport.StreamDialer {
 // PacketDialer dials bound IPv4 UDP connections.
 func (b *Binder) PacketDialer() transport.PacketDialer {
 	return transport.FuncPacketDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-		return b.dialer().DialContext(ctx, "udp4", addr)
+		conn, err := b.dialer().DialContext(ctx, "udp4", addr)
+		b.logDial("udp4", addr, conn, err)
+		return conn, err
 	})
 }
 

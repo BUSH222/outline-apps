@@ -92,6 +92,11 @@ func runCLIContext(t *testing.T, ctx context.Context, e env, args ...string) res
 	if e.openTUN == nil {
 		e.openTUN = func() (tunnel.TUN, error) { return placeholderTUN{}, nil }
 	}
+	if e.verify == nil {
+		e.verify = func(*configregistry.TransportPair, *slog.Logger) func(context.Context) error {
+			return func(context.Context) error { return nil }
+		}
+	}
 	if e.startTransport == nil {
 		e.startTransport = func(context.Context, tunnel.TUN, *configregistry.TransportPair, *slog.Logger) (func(), error) {
 			return func() {}, nil
