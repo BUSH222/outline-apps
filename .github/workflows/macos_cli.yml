@@ -1,0 +1,142 @@
+# Copyright 2026 The Outline Authors
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds the macOS CLI as a universal (arm64 + x86_64), ad hoc signed binary and
+# uploads it as a workflow artifact. Nothing here changes the runner's routes,
+# DNS or firewall; the only binary run is the version smoke test.
+# See docs/macos-cli/SPEC.md section 10.
+
+name: macOS CLI
+
+on:
+  push:
+    branches:
+      - feat/macos-cli
+      - master
+    paths:
+      - 'client/go/**'
+      - 'go.mod'
+      - 'go.sum'
+      - 'docs/macos-cli/build-local.sh'
+      - '.github/workflows/macos_cli.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-cli-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # M0: the CLI package does not exist yet, so this builds the upstream
+  # electron helper to prove the cgo (lwIP) toolchain on both architectures.
+  # From M1 on: PKG=./client/go/outline/macoscli, NAME=outline-cli,
+  # SMOKE_ARGS=version.
+  PKG: ./client/go/outline/electron
+  NAME: outline-electron-m0
+  SMOKE_ARGS: -version
+  MIN_MACOS: '12.0'
+
+jobs:
+  build:
+    name: Build darwin/${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            arch: arm64
+            machine: arm64
+          - runner: macos-15-intel
+            arch: amd64
+            machine: x86_64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: '${{ github.workspace }}/go.mod'
+
+      - name: Show toolchain
+        run: |
+          sw_vers
+          uname -m
+          go version
+          xcode-select -p
+          clang --version
+
+      - name: Check runner architecture
+        run: test "$(uname -m)" = "${{ matrix.machine }}"
+
+      - name: Vet
+        env:
+          CGO_ENABLED: '1'
+          MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
+          CGO_CFLAGS: -O2 -g -mmacosx-version-min=${{ env.MIN_MACOS }}
+          CGO_LDFLAGS: -mmacosx-version-min=${{ env.MIN_MACOS }}
+        run: go vet "$PKG"
+
+      - name: Build native slice
+        env:
+          VERSION: ${{ github.sha }}
+        run: docs/macos-cli/build-local.sh build "${{ matrix.arch }}"
+
+      - name: Upload slice
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: slice-${{ matrix.arch }}
+          path: output/macos-cli/${{ env.NAME }}-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 7
+
+  universal:
+    name: Universal binary
+    needs: build
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download slices
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: slice-*
+          path: output/macos-cli
+          merge-multiple: true
+
+      - name: Lipo, sign and verify
+        run: |
+          # Artifacts do not keep the executable bit.
+          chmod +x output/macos-cli/"$NAME"-*
+          docs/macos-cli/build-local.sh universal
+
+      - name: Upload universal binary
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.NAME }}-macos-universal
+          path: |
+            output/macos-cli/${{ env.NAME }}
+            output/macos-cli/${{ env.NAME }}.sha256
+          if-no-files-found: error
+          retention-days: 30
