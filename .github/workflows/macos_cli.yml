@@ -40,13 +40,9 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # M0: the CLI package does not exist yet, so this builds the upstream
-  # electron helper to prove the cgo (lwIP) toolchain on both architectures.
-  # From M1 on: PKG=./client/go/outline/macoscli, NAME=outline-cli,
-  # SMOKE_ARGS=version.
-  PKG: ./client/go/outline/electron
-  NAME: outline-electron-m0
-  SMOKE_ARGS: -version
+  PKG: ./client/go/outline/macoscli
+  NAME: outline-cli
+  SMOKE_ARGS: version
   MIN_MACOS: '12.0'
 
 jobs:
@@ -86,13 +82,15 @@ jobs:
       - name: Check runner architecture
         run: test "$(uname -m)" = "${{ matrix.machine }}"
 
-      - name: Vet
+      - name: Vet and test
         env:
           CGO_ENABLED: '1'
           MACOSX_DEPLOYMENT_TARGET: ${{ env.MIN_MACOS }}
           CGO_CFLAGS: -O2 -g -mmacosx-version-min=${{ env.MIN_MACOS }}
           CGO_LDFLAGS: -mmacosx-version-min=${{ env.MIN_MACOS }}
-        run: go vet "$PKG"
+        run: |
+          go vet "$PKG/..."
+          go test -race "$PKG/..."
 
       - name: Build native slice
         env:
