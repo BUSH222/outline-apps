@@ -106,10 +106,11 @@ type Options struct {
 	// host routes via the physical gateway as defense in depth; the transport's
 	// sockets are also bound to the physical interface.
 	FirstHops []netip.Addr
-	// OnNetworkChange is called after the system has been adjusted to a new
-	// physical network.
-	OnNetworkChange func(sysrouter.DefaultRoute)
-	Logger          *slog.Logger
+	// OnNetwork is called with the physical network and its resolvers: once
+	// after capturing them, before the transport starts (an error aborts the
+	// connect), and again after each network change.
+	OnNetwork func(route sysrouter.DefaultRoute, resolvers []netip.Addr) error
+	Logger    *slog.Logger
 }
 
 func (o *Options) logger() *slog.Logger {
@@ -195,6 +196,12 @@ func Up(ctx context.Context, opts Options) (_ *Session, err error) {
 			}
 		}
 	}()
+
+	if opts.OnNetwork != nil {
+		if err := opts.OnNetwork(primary, resolvers); err != nil {
+			return nil, err
+		}
+	}
 
 	tun, err := opts.OpenTUN()
 	if err != nil {
@@ -466,6 +473,8 @@ func Cleanup(ctx context.Context, r sysrouter.SystemRouter, store state.Store, l
 // removed only when everything was restored.
 func undo(ctx context.Context, r sysrouter.SystemRouter, store state.Store, st *state.State, closeTUN func() error, log *slog.Logger) error {
 	var errs []error
+	// Flush only if something that affects name resolution was undone.
+	changed := !st.Empty()
 	save := func() {
 		if err := store.Save(st); err != nil {
 			errs = append(errs, fmt.Errorf("saving state: %w", err))
@@ -508,8 +517,10 @@ func undo(ctx context.Context, r sysrouter.SystemRouter, store state.Store, st *
 	st.UTun = ""
 
 	// Last, after DNS (and in M5 /etc/hosts) is back.
-	if err := r.FlushDNSCache(ctx); err != nil {
-		log.Warn("flushing the DNS cache failed", "err", err)
+	if changed {
+		if err := r.FlushDNSCache(ctx); err != nil {
+			log.Warn("flushing the DNS cache failed", "err", err)
+		}
 	}
 
 	if len(errs) == 0 && st.Empty() {
@@ -524,7 +535,7 @@ func undo(ctx context.Context, r sysrouter.SystemRouter, store state.Store, st *
 
 // CheckNetwork adjusts the system if the physical network changed: the
 // physical routes move to the new gateway, DNS and IPv6 move to the new
-// service, and OnNetworkChange is called.
+// service, and OnNetwork is called.
 func (s *Session) CheckNetwork(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -590,8 +601,10 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 	if err := r.FlushDNSCache(ctx); err != nil {
 		s.log.Warn("flushing the DNS cache failed", "err", err)
 	}
-	if s.opts.OnNetworkChange != nil {
-		s.opts.OnNetworkChange(primary)
+	if s.opts.OnNetwork != nil {
+		if err := s.opts.OnNetwork(primary, parseAddrs(s.st.SystemResolvers)); err != nil {
+			return fmt.Errorf("switching to the new network: %w", err)
+		}
 	}
 	return nil
 }
@@ -665,6 +678,16 @@ func addrStrings(addrs []netip.Addr) []string {
 	var out []string
 	for _, a := range addrs {
 		out = append(out, a.String())
+	}
+	return out
+}
+
+func parseAddrs(ss []string) []netip.Addr {
+	var out []netip.Addr
+	for _, s := range ss {
+		if a, err := netip.ParseAddr(s); err == nil {
+			out = append(out, a)
+		}
 	}
 	return out
 }

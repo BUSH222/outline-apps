@@ -56,6 +56,7 @@ type harness struct {
 	logs      *bytes.Buffer
 	baseline  fakemac.Snapshot
 	netChange []sysrouter.DefaultRoute
+	resolvers [][]netip.Addr
 }
 
 func newHarness(t *testing.T, configure ...func(*fakemac.Mac)) *harness {
@@ -73,10 +74,14 @@ func newHarness(t *testing.T, configure ...func(*fakemac.Mac)) *harness {
 		StartTransport: func(context.Context, TUN) (func(), error) {
 			return func() { h.stopped.Store(true) }, nil
 		},
-		LocalPrefixes:   func() ([]netip.Prefix, error) { return []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}, nil },
-		FirstHops:       []netip.Addr{firstHop},
-		OnNetworkChange: func(r sysrouter.DefaultRoute) { h.netChange = append(h.netChange, r) },
-		Logger:          slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
+		LocalPrefixes: func() ([]netip.Prefix, error) { return []netip.Prefix{netip.MustParsePrefix("192.168.1.0/24")}, nil },
+		FirstHops:     []netip.Addr{firstHop},
+		OnNetwork: func(r sysrouter.DefaultRoute, resolvers []netip.Addr) error {
+			h.netChange = append(h.netChange, r)
+			h.resolvers = append(h.resolvers, resolvers)
+			return nil
+		},
+		Logger: slog.New(slog.NewTextHandler(h.logs, &slog.HandlerOptions{Level: slog.LevelDebug})),
 	}
 	return h
 }
@@ -447,8 +452,11 @@ func TestNetworkChange(t *testing.T) {
 	require.Equal(t, "USB 10/100/1000 LAN", st.Service)
 	require.Equal(t, "en7", st.Interface)
 	require.Equal(t, []string{"10.20.0.53"}, st.SystemResolvers)
-	require.Len(t, h.netChange, 1)
-	require.Equal(t, "en7", h.netChange[0].Interface)
+	require.Len(t, h.netChange, 2, "once at start, once for the change")
+	require.Equal(t, "en0", h.netChange[0].Interface)
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.168.1.1")}, h.resolvers[0])
+	require.Equal(t, "en7", h.netChange[1].Interface)
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("10.20.0.53")}, h.resolvers[1])
 
 	// A crash now is still recoverable from the state file alone.
 	h.mac.DestroyUTun("utun7")
@@ -500,4 +508,32 @@ func TestChooseUTunAddrs_AllTaken(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "10.111.222.1", local.String())
 	require.Equal(t, "10.111.222.2", peer.String())
+}
+
+func TestUp_OnNetworkRunsBeforeTheTransport(t *testing.T) {
+	h := newHarness(t)
+	var order []string
+	h.opts.OnNetwork = func(r sysrouter.DefaultRoute, _ []netip.Addr) error {
+		order = append(order, "network "+r.Interface)
+		return nil
+	}
+	h.opts.StartTransport = func(context.Context, TUN) (func(), error) {
+		order = append(order, "transport")
+		return func() {}, nil
+	}
+	s, err := Up(context.Background(), h.opts)
+	require.NoError(t, err)
+	require.Equal(t, []string{"network en0", "transport"}, order)
+	require.NoError(t, s.Down(context.Background()))
+}
+
+func TestUp_OnNetworkErrorAbortsBeforeAnyChange(t *testing.T) {
+	h := newHarness(t)
+	h.opts.OnNetwork = func(sysrouter.DefaultRoute, []netip.Addr) error {
+		return errors.New("no such interface")
+	}
+	_, err := Up(context.Background(), h.opts)
+	require.ErrorContains(t, err, "no such interface")
+	require.Empty(t, mutations(h.exec.Calls()))
+	h.requireRestored(t)
 }
