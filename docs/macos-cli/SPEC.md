@@ -46,7 +46,8 @@ This is for personal use. Distribution, notarization and a GUI are out of scope.
 - **[verified]** `golang.org/x/net/dns/dnsmessage` is usable: `golang.org/x/net v0.44.0` is already an indirect dependency with a `go.sum` hash, and the pinned SDK imports `dnsmessage`. Using it only moves x/net to the direct block of `go.mod`.
 - **[verified]** `IP_BOUND_IF = 0x19` and `IPV6_BOUND_IF = 0x7d` exist in `golang.org/x/sys@v0.36.0/unix` for darwin amd64 and arm64.
 - **[verified]** All SDK APIs used here are present in the pinned `golang.getoutline.org/sdk@v0.1.0-rc1`. SDK master is irrelevant, because the CLI compiles only against the pinned version.
-- **[unverified]** `IP_BOUND_IF` sockets ignore the utun routes and use the physical interface's scoped default route; `IPV6_BOUND_IF` also scopes IPv4-mapped traffic on dual-stack sockets; the kernel removes utun routes when the process dies; a pf anchor loads under `com.apple/*` without editing `/etc/pf.conf`. The first two are probed by a local, root-free test in M3; all four are checked in `MANUAL_TEST.md`.
+- **[verified, local probe]** `IP_BOUND_IF` scopes sockets to an interface (a socket bound to `lo0` gets "no route" for outside addresses), and `IPV6_BOUND_IF` also scopes IPv4-mapped traffic on dual-stack sockets.
+- **[unverified]** On the real interface, bound sockets bypass the utun routes; the kernel removes utun routes when the process dies; a host route for `169.254.113.53` via the utun wins over the on-link `169.254/16` route; a pf anchor loads under `com.apple/*` without editing `/etc/pf.conf`. All are checked in `MANUAL_TEST.md`.
 
 ## 4. Architecture decisions
 

@@ -89,3 +89,23 @@ Command: `PKG=./client/go/outline/electron NAME=outline-electron-m0 SMOKE_ARGS=-
 - Routes that already exist (for example macOS's own `169.254/16` link route) are never recorded or removed.
 - First-hop host routes are skipped for addresses inside the excluded ranges, which are already off the tunnel. IPv6-only servers are refused, because IPv6 is off during a session.
 - The utun subnet avoids the subnets of local interfaces; the candidates mirror `kVpnSubnetCandidates`. The address is chosen in order rather than at random, so it's predictable.
+
+## 8. M3 notes (interface binding, first real connect)
+
+- **N1 and N2 checked locally** (`internal/netbind/probe_darwin_test.go`, no root, every operation has a 2 s deadline):
+  - Sockets bound to `lo0` with `IP_BOUND_IF` reach loopback, but get "no route" for `192.0.2.1` instead of leaving through the physical interface. This holds for TCP, a UDP dial, and a UDP listener.
+  - `IPV6_BOUND_IF` on a dual-stack socket also scopes IPv4-mapped traffic ("network is unreachable"). The CLI doesn't depend on this, because all its sockets are IPv4.
+  - Whether the real interface's scoped route bypasses the utun routes is still checked only in `MANUAL_TEST.md`.
+- **The binder fails closed:** it refuses to create any socket until an interface is set, and a failed `setsockopt` fails the dial. Sockets are IPv4-only (`tcp4`/`udp4`), matching IPv6-off.
+- **Host-name lookups in the transport** use a Go resolver that sends queries to the resolvers captured before DNS was changed, over bound sockets. The address the system asks for is ignored, because it would be the tunnel's. If no IPv4 resolver was captured, it falls back to `1.1.1.1` (D2).
+- **Real `connect` order:**
+  1. Root check, lock, and recovery of a crashed session (before the key fetch).
+  2. Parse the transport on bound dialers.
+  3. Bind to the captured interface (an error aborts before any change).
+  4. Open the utun, start lwIP, `NotifyNetworkChanged()`, and wait for the TCP health check.
+  5. Routes, DNS and IPv6, then flush the DNS cache.
+  6. Poll for network changes every 2 s. Ctrl-C, SIGTERM and SIGHUP restore everything.
+- A usage reporter in a key is ignored, with a warning.
+- Tests refuse every real socket by default, so they never send traffic out.
+- `go test -race` prints `ld: warning: ... malformed LC_DYSYMTAB` with the current Apple linker. This is a known, harmless linker warning for race builds.
+- Not handled yet: detecting a dead transport while connected (traffic stops until Ctrl-C).
