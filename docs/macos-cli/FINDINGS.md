@@ -26,6 +26,9 @@ Command Line Tools only (Apple clang 17, MacOSX 15.5 SDK). No full Xcode.
 | N2 | `IPV6_BOUND_IF` on a dual-stack `AF_INET6` socket (Go's wildcard `ListenPacket("udp")`) also scopes IPv4-mapped traffic | Same M3 probe on a `"udp"` wildcard listener | Use `udp4` listeners while IPv6 is off; set both options and ignore EINVAL on the one that doesn't apply |
 | N3 | When the process dies, the kernel destroys the utun and the routes that point at it | `MANUAL_TEST.md` (`kill -9`, then `netstat -rn`) | `cleanup` deletes every recorded route either way |
 | N4 | A pf anchor loads under the stock `anchor "com.apple/*"` without editing `/etc/pf.conf` | `MANUAL_TEST.md` (`pfctl -a com.apple/outline-cli -sr`) | A guarded edit of `/etc/pf.conf` |
+| N5 | A host route for the link-local `169.254.113.53` via `-interface utunN` is accepted and wins over the on-link `169.254/16` route | `MANUAL_TEST.md` (`route -n get 169.254.113.53` shows the utun) | Pick a non-link-local DNS address for the intercept (needs the address to be configurable; upstream hard-codes it) |
+| N6 | The parsers match real output of `netstat -rn -f inet`, `networksetup -listnetworkserviceorder / -getdnsservers / -getinfo`, `scutil --dns` and `route -n get` on macOS 15 (fixtures follow the documented formats; no real output was captured). Manual IPv6 restore needs `networksetup -getinfo` to print a prefix length; if it doesn't, IPv6 is left alone with a warning | `connect --dry-run` on the developer's Mac runs exactly these read-only queries | Fix the parser from the pasted output |
+| N7 | `route -n get -net X` reports the matching route itself when an exact route exists (used to avoid recording routes the CLI didn't add) | `MANUAL_TEST.md` | Compare against `netstat -rn` instead |
 
 ## 3. Findings that change the design
 
@@ -77,3 +80,12 @@ Command: `PKG=./client/go/outline/electron NAME=outline-electron-m0 SMOKE_ARGS=-
 
 - The commitlint `scope-enum` only allows listed scopes. This work uses `client/macos`.
 - License headers are checked without npm: `go tool task addlicense -- -check`.
+
+## 7. M2 notes (tunnel manager)
+
+- `connect --dry-run` now prints the exact connect and disconnect command sequences. It runs only read-only queries (`netstat`, `scutil --dns`, `route -n get`, and `networksetup -listnetworkserviceorder`, `-getdnsservers` and `-getinfo`). Tests use a simulated Mac that fails on any change.
+- `connect` without `--dry-run` stays disabled until M3. Without interface-bound sockets, the transport's own traffic would loop into the tunnel.
+- Crash safety is tested by crashing before each of the 24 system changes of a connect and then running `cleanup` from the state file alone. That is 48 cases: with and without the kernel removing the utun's routes. Every case must restore routes, DNS and IPv6 exactly.
+- Routes that already exist (for example macOS's own `169.254/16` link route) are never recorded or removed.
+- First-hop host routes are skipped for addresses inside the excluded ranges, which are already off the tunnel. IPv6-only servers are refused, because IPv6 is off during a session.
+- The utun subnet avoids the subnets of local interfaces; the candidates mirror `kVpnSubnetCandidates`. The address is chosen in order rather than at random, so it's predictable.
