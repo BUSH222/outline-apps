@@ -28,10 +28,13 @@ import (
 	"os/user"
 	"strings"
 	"syscall"
+	"time"
 
+	"localhost/client/go/outline/macoscli/internal/netbind"
 	"localhost/client/go/outline/macoscli/internal/redact"
 	"localhost/client/go/outline/macoscli/internal/state"
 	"localhost/client/go/outline/macoscli/internal/sysexec"
+	"localhost/client/go/outline/macoscli/internal/tunnel"
 )
 
 // version is set at build time with -ldflags "-X main.version=...".
@@ -79,6 +82,14 @@ type env struct {
 	lookup lookupFunc
 	// localPrefixes lists local IPv4 networks; nil means the host's interfaces.
 	localPrefixes func() ([]netip.Prefix, error)
+	// bind and interfaceIndex bind the transport's sockets to the physical interface.
+	bind           netbind.BindFunc
+	interfaceIndex func(string) (int, error)
+	// openTUN opens the utun; startTransport runs the VPN over it.
+	openTUN        func() (tunnel.TUN, error)
+	startTransport startTransportFunc
+	// watchInterval is how often network changes are checked; 0 means 2 s.
+	watchInterval time.Duration
 }
 
 func main() {
@@ -93,6 +104,11 @@ func main() {
 		exec:       sysexec.Real{},
 		stateDir:   state.DefaultDir,
 		lookup:     defaultLookup,
+
+		bind:           netbind.PlatformBind,
+		interfaceIndex: netbind.InterfaceIndex,
+		openTUN:        tunnel.OpenUTun,
+		startTransport: startRemoteDevice,
 	}))
 }
 

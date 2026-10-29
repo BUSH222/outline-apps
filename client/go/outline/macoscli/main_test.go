@@ -19,6 +19,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
@@ -26,9 +28,12 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
+	"localhost/client/go/outline/configregistry"
 	"localhost/client/go/outline/macoscli/internal/fakemac"
+	"localhost/client/go/outline/macoscli/internal/tunnel"
 
 	"github.com/stretchr/testify/require"
 )
@@ -60,8 +65,38 @@ type result struct {
 
 func runCLI(t *testing.T, e env, args ...string) result {
 	t.Helper()
-	var stdout, stderr bytes.Buffer
+	return runCLIContext(t, context.Background(), e, args...)
+}
+
+// runCLIContext runs the CLI with fakes for everything that touches the
+// system. If e.stdout is set, output goes there too.
+func runCLIContext(t *testing.T, ctx context.Context, e env, args ...string) result {
+	t.Helper()
+	var stdout, stderr syncBuffer
+	if e.stdout != nil {
+		stdout.tee = e.stdout
+	}
 	e.stdout, e.stderr = &stdout, &stderr
+	if e.bind == nil {
+		// Refuse every transport socket: tests never use the real network.
+		e.bind = func(uintptr, string, int) error { return errors.New("test: no real sockets") }
+	}
+	if e.interfaceIndex == nil {
+		e.interfaceIndex = func(name string) (int, error) {
+			if name == "en0" || name == "en7" {
+				return 6, nil
+			}
+			return 0, errors.New("no such interface")
+		}
+	}
+	if e.openTUN == nil {
+		e.openTUN = func() (tunnel.TUN, error) { return placeholderTUN{}, nil }
+	}
+	if e.startTransport == nil {
+		e.startTransport = func(context.Context, tunnel.TUN, *configregistry.TransportPair, *slog.Logger) (func(), error) {
+			return func() {}, nil
+		}
+	}
 	if e.getenv == nil {
 		home := t.TempDir()
 		e.getenv = func(k string) string {
@@ -90,8 +125,30 @@ func runCLI(t *testing.T, e env, args ...string) result {
 	if e.lookup == nil {
 		e.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no DNS in tests") }
 	}
-	code := run(context.Background(), args, e)
+	code := run(ctx, args, e)
 	return result{code, stdout.String(), stderr.String()}
+}
+
+// syncBuffer is a goroutine-safe buffer that can copy writes to tee.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+	tee io.Writer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.tee != nil {
+		b.tee.Write(p)
+	}
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 func requireNoSecrets(t *testing.T, r result) {
@@ -126,13 +183,13 @@ func TestNotImplementedCommands(t *testing.T) {
 	}
 }
 
-func TestConnectWithoutDryRunChangesNothing(t *testing.T) {
+func TestConnectWithoutRootChangesNothing(t *testing.T) {
 	fetched := false
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fetched = true }))
 	defer server.Close()
 	r := runCLI(t, env{httpTransport: server.Client().Transport}, "connect", "--key", server.URL+"/FAKE")
 	require.Equal(t, exitError, r.code)
-	require.Contains(t, r.stderr, "not implemented yet")
+	require.Contains(t, r.stderr, "must run as root")
 	require.False(t, fetched, "connect must refuse before fetching the key")
 }
 

@@ -27,7 +27,10 @@ import (
 	"strings"
 	"time"
 
+	"localhost/client/go/configyaml"
+	"localhost/client/go/outline/configregistry"
 	"localhost/client/go/outline/macoscli/internal/keys"
+	"localhost/client/go/outline/macoscli/internal/netbind"
 	"localhost/client/go/outline/macoscli/internal/redact"
 	"localhost/client/go/outline/macoscli/internal/state"
 	"localhost/client/go/outline/macoscli/internal/sysexec"
@@ -69,16 +72,19 @@ func runConnect(ctx context.Context, args []string, e env) int {
 		fmt.Fprintf(e.stderr, "outline-cli connect: %v\n", err)
 		return exitUsage
 	}
-	if !f.dryRun {
-		// Refuse before fetching anything, so a real connect never half-runs.
-		// It needs interface-bound sockets (M3); without them the transport's
-		// own traffic would loop into the tunnel.
-		return notImplemented(e, "connect without --dry-run", "M3")
-	}
-
 	fail := func(err error) int {
 		fmt.Fprintf(e.stderr, "outline-cli connect: %s\n", secrets.Error(err))
 		return exitError
+	}
+
+	if !f.dryRun {
+		// Before reading the key: a dynamic key is fetched directly, which
+		// needs a working network, not one left pointing at a dead tunnel.
+		unlock, err := prepareSession(ctx, e, logger)
+		if err != nil {
+			return fail(err)
+		}
+		defer unlock()
 	}
 
 	raw, err := keys.Read(keys.Input{Key: f.key, KeyFile: f.keyFile, Getenv: e.getenv})
@@ -96,12 +102,23 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	if err != nil {
 		return fail(err)
 	}
-	parsed, err := keys.ParseClientConfig(ctx, resolved.ClientConfig, nil)
+	// A real connect builds the transport on interface-bound sockets. The dry
+	// run only inspects the config, so plain dialers are fine (parsing does no
+	// network I/O).
+	binder := netbind.NewWith(e.bind, e.interfaceIndex)
+	var provider *configyaml.TypeParser[*configregistry.TransportPair]
+	if !f.dryRun {
+		provider = configregistry.NewDefaultTransportProvider(binder.StreamDialer(), binder.PacketDialer())
+	}
+	parsed, err := keys.ParseClientConfig(ctx, resolved.ClientConfig, provider)
 	if err != nil {
 		return fail(err)
 	}
 	if err := keys.CheckLoopSafe(parsed.Pair); err != nil {
 		return fail(err)
+	}
+	if parsed.HasReporter {
+		logger.Warn("this key includes a usage reporter, which outline-cli does not run")
 	}
 	rules, err := resolveRulesPath(f.rules, e.getenv, e.lookupUser)
 	if err != nil {
@@ -114,6 +131,15 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	hops, err := firstHopAddrs(ctx, parsed.Pair, e.lookup)
 	if err != nil {
 		return fail(err)
+	}
+
+	if !f.dryRun {
+		logger.Info("connecting", "key", resolved.Display, "transport", parsed.TransportType,
+			"rules", rules.Path+" ("+rulesStatus+")")
+		if err := runSession(ctx, e, logger, parsed.Pair, binder, hops); err != nil {
+			return fail(err)
+		}
+		return exitOK
 	}
 
 	// Every line goes through the redactor as a last guard.
