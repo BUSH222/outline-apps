@@ -88,7 +88,13 @@ func URL(raw string) string {
 		b.WriteString("@")
 	}
 	b.WriteString(host)
-	if tail != "" && tail != "/" {
+	switch tail {
+	case "":
+	case "/":
+		// Keep a bare slash, so re-redacting an already masked "host/<redacted>"
+		// (the pattern stops at "<") keeps its slash.
+		b.WriteString("/")
+	default:
 		b.WriteString("/")
 		b.WriteString(Mask)
 	}

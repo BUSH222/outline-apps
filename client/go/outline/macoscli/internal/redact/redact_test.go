@@ -39,9 +39,9 @@ func TestURL(t *testing.T) {
 		fakeLegacy:                           "ss://<redacted>",
 		fakeSSConf:                           "ssconf://config.example.test/<redacted>",
 		"https://example.test/a/b?c=d#e":     "https://example.test/<redacted>",
-		"https://example.test/":              "https://example.test",
+		"https://example.test/":              "https://example.test/",
 		"https://example.test":               "https://example.test",
-		"HTTPS://user:pw@example.test:8443/": "https://<redacted>@example.test:8443",
+		"HTTPS://user:pw@example.test:8443/": "https://<redacted>@example.test:8443/",
 		"not a url":                          "<redacted>",
 		"https://exa mple/":                  "https://<redacted>",
 	}
@@ -145,4 +145,15 @@ func TestReplaceAttr(t *testing.T) {
 	require.NotContains(t, out, "FAKE-path-token")
 	require.NotContains(t, out, "FAKE-query-token")
 	require.True(t, strings.Contains(out, Mask), out)
+}
+
+func TestRedact_IsIdempotentOnDisplayForms(t *testing.T) {
+	// Output is redacted again as a last guard, so display forms must survive it.
+	var s Secrets
+	s.AddKey(fakeSSConf)
+	for _, key := range []string{fakeSSKey, fakeLegacy, fakeSSConf, "https://example.test/x", "https://example.test/"} {
+		display := URL(key)
+		line := "key: " + display + " (from --key)"
+		require.Equal(t, line, s.Redact(line), "key %q", key)
+	}
 }

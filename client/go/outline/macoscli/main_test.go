@@ -153,8 +153,8 @@ func TestDryRun_DynamicKey(t *testing.T) {
 
 	r := runCLI(t, env{getenv: getenv, httpTransport: server.Client().Transport}, "connect", "--dry-run")
 	require.Equal(t, exitOK, r.code, r.stderr)
-	require.Contains(t, r.stdout, "key:             dynamic, ssconf://127.0.0.1:")
-	require.Contains(t, r.stdout, "(from OUTLINE_KEY)")
+	hostPort := strings.TrimPrefix(server.URL, "https://")
+	require.Contains(t, r.stdout, "key:             dynamic, ssconf://"+hostPort+"/<redacted> (from OUTLINE_KEY)")
 	require.Contains(t, r.stdout, "transport:       tcpudp")
 	require.Contains(t, r.stdout, "connection type: tunneled (TCP tunneled, UDP tunneled)")
 	require.Contains(t, r.stdout, "first hop:       192.0.2.20:443")
