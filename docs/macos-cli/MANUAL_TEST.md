@@ -47,8 +47,9 @@ Try these in order. Each step is safe to repeat.
   ```
 - Put your key in a file only you can read:
   ```sh
-  install -m 600 /dev/null ~/.outline-key && pbpaste > ~/.outline-key
+  pbpaste > access-key.txt && chmod 600 access-key.txt   # in the folder with outline-cli, after copying the key
   ```
+- Run every `./outline-cli` command from the folder that holds `outline-cli`: its key (`access-key.txt`) and rules (`rules.yaml`) are read from there.
 - Keep a second terminal open for checks.
 - Record the baseline, so you can compare after disconnecting:
   ```sh
@@ -61,7 +62,7 @@ Try these in order. Each step is safe to repeat.
 ## 2. Dry run (no root)
 
 ```sh
-./outline-cli connect --dry-run --key-file ~/.outline-key
+./outline-cli connect --dry-run
 ```
 
 Expected: the key is shown redacted, the first-hop IP(s) are listed, and the connect list includes `route -n add -host <first hop IP> <your router>`. If macOS has a cached route for the server (it usually does right after the key is fetched), a `route -n delete -host <first hop IP>` comes just before it. Nothing changes on the system.
@@ -77,7 +78,7 @@ netstat -rn -f inet | grep -E '^default|^<first hop IP>' > /tmp/before-defaults.
 Then connect:
 
 ```sh
-sudo ./outline-cli connect --key-file ~/.outline-key --log-level debug 2>&1 | tee -i /tmp/outline-cli.log
+sudo ./outline-cli connect --log-level debug 2>&1 | tee -i /tmp/outline-cli.log
 ```
 
 Expected, in order:
@@ -107,6 +108,14 @@ In the second terminal:
 | Local network still works | `ping -c 2 <your router IP>` | Replies |
 | State file exists | `sudo cat /var/db/outline-cli/state.json` | Lists the routes, `prevDNS` and `prevIPv6` |
 
+### Double-click
+
+1. Disconnect (Ctrl-C) if connected. Move `access-key.txt` and `rules.yaml` away from the folder (or test with a copy of `outline-cli` in an empty folder).
+2. Double-click `outline-cli` in Finder. Expected: a Terminal window says it needs administrator rights and asks for your password, then prints `created .../access-key.txt: paste your access key into it`, `created .../rules.yaml: ...`, and stops with `no access key yet: paste your Outline access key into ...`. Nothing on the system changed. Both new files belong to you (`ls -l`), and `access-key.txt` has mode `-rw-------`.
+3. Paste the key into `access-key.txt` (any editor), save, and double-click again. Expected: it connects (`connected: ...`). `curl -4 -s https://ifconfig.me` shows the server's IP.
+4. Press Ctrl-C in that window. Expected: `disconnected: routes, DNS and IPv6 are restored`.
+5. Optional: connect again by double-click and close the Terminal window instead (confirm "Terminate"). The network should be restored the same way (check as in section 4).
+
 ## 4. Disconnect
 
 Press Ctrl-C in the first terminal. Expected: `disconnected: routes, DNS and IPv6 are restored`. Then:
@@ -130,7 +139,7 @@ curl -4 -s https://ifconfig.me; echo        # your normal IP again
    ```
 4. Run `sudo ./outline-cli cleanup --dry-run`, then `sudo ./outline-cli cleanup`. Expected: `restored the network: ...`.
 5. Repeat the checks from step 4. All should be back to the baseline.
-6. Also check that `connect` recovers by itself: crash again (steps 1–2), then run `sudo ./outline-cli connect --key-file ~/.outline-key` directly. Expected: a warning `restored the network left behind by a previous session`, and then it connects normally.
+6. Also check that `connect` recovers by itself: crash again (steps 1–2), then run `sudo ./outline-cli connect` directly. Expected: a warning `restored the network left behind by a previous session`, and then it connects normally.
 
 ## 6. Network change
 
@@ -145,17 +154,16 @@ While connected:
 
 ## 7. Bypass list
 
-Domains under `bypass:` never use the VPN. Each entry covers the domain and all its subdomains (`icanhazip.com` covers `ipv4.icanhazip.com`, but not `noticanhazip.com`). The rules file is `~/.config/outline-cli/rules.yaml` of the user who runs `sudo`; `--rules PATH` overrides it.
+Domains under `bypass:` never use the VPN. Each entry covers the domain and all its subdomains (`icanhazip.com` covers `ipv4.icanhazip.com`, but not `noticanhazip.com`). The rules file is `rules.yaml` next to `outline-cli`; `--rules PATH` overrides it.
 
-1. Create the rules file (as yourself, not with sudo):
+1. Write the rules file (as yourself, not with sudo):
    ```sh
-   mkdir -p ~/.config/outline-cli
-   cat > ~/.config/outline-cli/rules.yaml <<'EOF'
+   cat > rules.yaml <<'EOF'
    bypass:
      - icanhazip.com
    EOF
    ```
-2. Dry run: `./outline-cli connect --dry-run --key-file ~/.outline-key`. Expected: `rules file: ... (found: 1 bypass, 0 vpn_only)` and `bypass: icanhazip.com`.
+2. Dry run: `./outline-cli connect --dry-run`. Expected: `rules file: ... (found: 1 bypass, 0 vpn_only)` and `bypass: icanhazip.com`.
 3. Connect as in step 3, with `--log-level debug`. Expected, before the checks: `domain rules are on bypass=1 vpn_only=0`. Within a second or two after `connected:`, the log shows `learned an address domain=icanhazip.com ... class=bypass` (the name is resolved ahead of time through your network's DNS), each followed by `added a direct route for a bypass address`.
 4. In the second terminal:
 
@@ -190,7 +198,7 @@ Domains under `vpn_only:` only ever go through the VPN. After `sudo outline-cli 
 
 1. Add a `vpn_only` entry to the rules file:
    ```sh
-   cat > ~/.config/outline-cli/rules.yaml <<'EOF'
+   cat > rules.yaml <<'EOF'
    bypass:
      - icanhazip.com
    vpn_only:

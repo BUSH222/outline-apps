@@ -76,8 +76,8 @@ outline-cli version
 - `sudo` resets the environment by default (`env_reset`), so `OUTLINE_KEY=… sudo outline-cli` loses the key. Recommended: `--key-file PATH`; the CLI warns if the file is readable by group or others (it should be mode 0600). The alternative, `sudo env OUTLINE_KEY=… outline-cli connect`, briefly shows the key in the process list. `--key` works but lands in shell history.
 - Rules file lookup, in order:
   1. `--rules PATH` if given.
-  2. Otherwise, if `SUDO_USER` is set: that user's home directory, found with `user.Lookup` (not `$HOME`, which may be root's), plus `/.config/outline-cli/rules.yaml`.
-  3. Otherwise: `$HOME/.config/outline-cli/rules.yaml`.
+  2. Otherwise: `rules.yaml` next to the executable. **(Changed after M6 at the developer's request; it was the invoking user's `~/.config/outline-cli/rules.yaml`.)**
+- **Default files and double-click (added after M6):** without `--key`, `--key-file` or `OUTLINE_KEY`, the key is read from `access-key.txt` next to the executable. A real `connect` creates a missing `access-key.txt` (empty, 0600) and `rules.yaml` (comments only) there, owned by `SUDO_UID`/`SUDO_GID`, and stops if the key is empty. With no arguments (a Finder double-click), the CLI re-executes itself as `sudo EXE connect`.
   - A missing file means no rules (logged).
   - An invalid file is an error.
   - `--dry-run` prints the resolved path.

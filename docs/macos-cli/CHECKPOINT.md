@@ -87,7 +87,9 @@ verify.go          post-routing checks: 1) the transport reaches the server with
                    2) an ordinary HTTP request works through the tunnel (if not, probe DNS at 169.254.113.53)
 cleanup.go         cleanup [--dry-run]
 firsthop.go        resolve the transport's first hops to IPv4 (refuses IPv6-only servers)
-rules_path.go      --rules, else SUDO_USER's home (user.Lookup), else $HOME; .config/outline-cli/rules.yaml
+rules_path.go      --rules, else rules.yaml next to the executable; loadRules
+files.go           default files next to the executable (access-key.txt, rules.yaml): exeDir, ensureFile
+                   (created if missing, chowned to SUDO_UID); no arguments = double-click = sudo EXE connect
 
 internal/redact    secret scrubbing for logs, errors and output; also the slog ReplaceAttr hook
 internal/keys      Read (flag/file/env), Resolver (ss/ssconf/https/config file), Fetcher (https only,
@@ -172,7 +174,7 @@ Done (details in `FINDINGS.md` section 19):
 
 ## 8b. After M6
 
-All milestones are done. What's left is optional; ask the developer before starting any of it.
+All milestones are done. After M6, at the developer's request: the key and rules files live next to the executable and are created if missing, and running it with no arguments (a Finder double-click) connects through `sudo` (FINDINGS 23; not yet tried on the real Mac: `MANUAL_TEST.md` section 3, "Double-click"). What's left is optional; ask the developer before starting any of it.
 - **Known gaps** (all in `README.md` "Limits"):
   - On 2026-10-30 a dry run on the developer's Mac saw `utun4` as the primary default route (some other VPN, or the CLI itself, was up). `connect` doesn't refuse to start while another tunnel owns the default route; it would bind to that utun. Ask, then consider refusing a utun as the physical interface.
   - A dead transport isn't detected while connected (traffic stops until Ctrl-C).

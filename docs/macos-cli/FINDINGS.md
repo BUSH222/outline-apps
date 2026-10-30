@@ -340,3 +340,12 @@ Between the crash and the recovery, nothing that needs DNS works (DNS still poin
 - `docs/macos-cli/README.md`: recovery first, then install (CI artifact with `chmod +x`, `xattr -dr com.apple.quarantine` and the SHA-256 check; or `build-local.sh`), the key file, connect, rules, lockdown, limits, what the CLI changes on the Mac, and pointers for developers.
 - `MANUAL_TEST.md`: scope finalized; the lockdown checks fill in the learned address with a command, because the developer twice hit zsh reading a leftover `<address>` placeholder as a redirect.
 - CI already builds, signs and uploads the universal artifact `outline-cli-macos-universal`; the developer has been testing with downloads of it.
+
+## 23. After M6: double-click start and files next to the program
+
+Requested by the developer:
+- **Default files next to the executable** (`os.Executable`, symlinks resolved): `access-key.txt` (used when no `--key`, `--key-file` or `OUTLINE_KEY` is given) and `rules.yaml` (used without `--rules`; also by `lockdown`). This replaces the invoking user's `~/.config/outline-cli/rules.yaml`.
+- **Created if missing**, by a real `connect` only (after the root check, before the key is read): `access-key.txt` empty with mode 0600, `rules.yaml` with a comments-only template (which parses as "no rules"). Under `sudo` both are given to `SUDO_UID`/`SUDO_GID`, so the user can edit them. An existing file is never overwritten (`O_EXCL`). An empty key stops the connect with instructions, before any system change. A dry run creates nothing and says what's missing.
+- **No arguments** (what a Finder double-click runs) means `connect` with those files. Finder starts the program as the user in a Terminal window, so it replaces itself with `sudo -p "Password for %u: " EXE connect`; sudo asks for the password there and forwards Ctrl-C and the window's SIGHUP, which restore the network as before.
+- The error for an empty key avoids writing `ss://`-like examples: the redactor masks them, by design.
+- Tests use a temporary executable location and an `elevate` stub, so they never run the real `sudo` and never write next to the test binary.

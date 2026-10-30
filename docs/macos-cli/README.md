@@ -49,18 +49,30 @@ shasum -a 256 -c outline-cli.sha256           # optional: check the download
 docs/macos-cli/build-local.sh     # writes output/macos-cli/outline-cli (universal, signed ad hoc)
 ```
 
-A local build isn't quarantined, so `chmod` and `xattr` aren't needed. Optionally copy the binary somewhere on your `PATH`, for example `sudo install -m 755 output/macos-cli/outline-cli /usr/local/bin/`.
-
-## Your access key
-
-Put the key in a file only you can read:
+A local build isn't quarantined, so `chmod` and `xattr` aren't needed. Copy it into a folder of its own, since its key and rules files go next to it:
 
 ```sh
-install -m 600 /dev/null ~/.outline-key
-pbpaste > ~/.outline-key      # after copying the key
+mkdir -p ~/Applications/outline-cli && cp output/macos-cli/outline-cli ~/Applications/outline-cli/
 ```
 
-Then pass `--key-file ~/.outline-key`. The other ways and their drawbacks:
+(If you put it somewhere on your `PATH` instead, such as `/usr/local/bin`, the files go there too; or pass `--key-file` and `--rules`.)
+
+## Start it with a double-click
+
+Keep `outline-cli` in a folder of its own (for example `~/Applications/outline-cli/`). Next to it, it uses two files:
+
+- `access-key.txt`: your access key (`ss://`, `ssconf://` or `https://`, or a transport config);
+- `rules.yaml`: the bypass and VPN-only rules (see below).
+
+**Double-click `outline-cli` in Finder.** A Terminal window opens and asks for your Mac password (it changes network settings, so it runs itself through `sudo`). Then it connects. **Press Ctrl-C in that window to disconnect** (closing the window works too).
+
+The first time, it creates both files, owned by you: `access-key.txt` empty (mode 600, readable only by you) and `rules.yaml` with only comments (no rules). It then stops and asks for the key: paste the key into `access-key.txt`, save, and double-click again. If either file goes missing later, it is created again the same way.
+
+From a terminal, `./outline-cli` with no arguments does the same as a double-click, and `sudo ./outline-cli connect` does it without the restart through `sudo`.
+
+## Other ways to pass the key
+
+The key and rules files can live elsewhere: `--key-file PATH` and `--rules PATH` override the files next to the program. Then:
 
 - `--key KEY` puts the key in your shell history.
 - `OUTLINE_KEY=...` is dropped by `sudo`; `sudo env OUTLINE_KEY=... outline-cli connect` works but shows the key in the process list while it starts.
@@ -70,26 +82,26 @@ The CLI warns if the key file is readable by others, and never prints or logs th
 
 Not every config works: configs that would send traffic around the server without going through the CLI (`basic-access`, or `udp` set to `direct` or missing) are refused, because their sockets would loop back into the tunnel.
 
-## Connect
+## Connect from a terminal
 
 ```sh
-outline-cli connect --dry-run --key-file ~/.outline-key    # no root: shows the plan, changes nothing
-sudo outline-cli connect --key-file ~/.outline-key         # connect; Ctrl-C disconnects
+./outline-cli connect --dry-run       # no root: shows the plan, changes nothing (and creates no files)
+sudo ./outline-cli connect            # connect; Ctrl-C disconnects
 ```
 
-On connect it checks that the server answers, routes all IPv4 traffic and DNS into the tunnel, turns IPv6 off on the active network service, and checks that traffic flows. If a check fails, it undoes everything itself. `Ctrl-C`, `SIGTERM` and `SIGHUP` restore everything.
+On connect it checks that the server answers, routes all IPv4 traffic and DNS into the tunnel, turns IPv6 off on the active network service, and checks that traffic flows. If a check fails, it undoes everything itself. `Ctrl-C`, `SIGTERM` and `SIGHUP` (closing the window) restore everything.
 
 While connected it follows network changes (another Wi-Fi network, a hotspot, Ethernet) every 2 seconds.
 
-Useful flags: `--log-level debug` (what it does and why), `--rules PATH` (see below). To keep a log, use `tee -i` (plain `tee` stops on Ctrl-C):
+Useful flags: `--log-level debug` (what it does and why), `--key-file PATH`, `--rules PATH`. To keep a log, use `tee -i` (plain `tee` stops on Ctrl-C):
 
 ```sh
-sudo outline-cli connect --key-file ~/.outline-key --log-level debug 2>&1 | tee -i /tmp/outline-cli.log
+sudo ./outline-cli connect --log-level debug 2>&1 | tee -i /tmp/outline-cli.log
 ```
 
 ## Rules: bypass and VPN-only
 
-The rules file is `~/.config/outline-cli/rules.yaml` of the user who runs `sudo` (not root's), or the file given with `--rules`. Without one, all traffic goes through the VPN.
+The rules file is `rules.yaml` next to `outline-cli`, or the file given with `--rules`. With no rules, all traffic goes through the VPN.
 
 ```yaml
 bypass:              # never through the VPN
@@ -123,7 +135,7 @@ sudo outline-cli unlock                # remove the block
 - **pf rules** (anchor `com.apple/outline-cli`) that block the vpn_only addresses learned while connected. While you're connected, they let them through the tunnel only. If the CLI crashes, they keep blocking.
 - **An `/etc/hosts` block** that resolves the vpn_only names to nothing. It's taken out while you're connected, so the names work through the VPN.
 
-`connect` and `cleanup` put both back after a session or a crash; only `unlock` removes them. `lockdown` and `unlock` refuse to run while `connect` is running. After editing `vpn_only`, run `lockdown` again.
+It reads the same `rules.yaml` (or `--rules PATH`). `connect` and `cleanup` put both back after a session or a crash; only `unlock` removes them. `lockdown` and `unlock` refuse to run while `connect` is running. After editing `vpn_only`, run `lockdown` again.
 
 `lockdown` never looks the names up itself, since that would send the lookups outside the VPN. Connect once first: the CLI looks the listed names up through the VPN by itself, and also learns the addresses of the subdomains you use.
 
@@ -159,6 +171,7 @@ General:
 | IPv6 of the active service turned off | connect | disconnect, `cleanup` (the exact previous setting) |
 | pf anchor `com.apple/outline-cli`, pf enabled | `lockdown` | `unlock` |
 | A marked block in `/etc/hosts` | `lockdown` (out while connected) | `unlock` |
+| `access-key.txt` and `rules.yaml` next to the program, if missing | connect | never (they are your files) |
 | `/var/db/outline-cli/`: `state.json` (what to undo), `lock`, `lockdown.json`, `vpn_only.json` (learned addresses), `anchor.conf`, `hosts.backup` | as above | the session's and lockdown's files are removed when undone |
 
 Every change is recorded in `state.json` before it's made, so `cleanup` can undo a session even after `kill -9`.
