@@ -370,9 +370,9 @@ func TestRouter_LookupRoute(t *testing.T) {
 	})
 	ctx := context.Background()
 	for dst, want := range map[string]RouteStatus{
-		"169.254.0.0/16":     RoutePresent,
-		"0.0.0.0/1":          RouteAbsent,
-		"203.0.113.0/24":     RouteAbsent,
+		"169.254.0.0/16":  RoutePresent,
+		"0.0.0.0/1":       RouteAbsent,
+		"203.0.113.0/24":  RouteAbsent,
 		"203.0.113.50/32": RouteCloned,
 	} {
 		got, err := r.LookupRoute(ctx, netip.MustParsePrefix(dst))

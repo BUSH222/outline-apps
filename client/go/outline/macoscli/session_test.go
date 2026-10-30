@@ -178,9 +178,9 @@ func TestConnect_FailedVerificationRestoresTheNetwork(t *testing.T) {
 	mac := fakemac.New()
 	baseline := mac.Snapshot()
 	e, ctx := sessionEnv(t, mac)
-	e.verify = func(*configregistry.TransportPair, *slog.Logger) func(context.Context) error {
+	e.verify = func(verifyInput) func(context.Context) error {
 		return func(context.Context) error {
-			return errors.New("check 2/2 failed: DNS at 169.254.113.53 doesn't answer")
+			return errors.New("check 2/3 failed: DNS at 169.254.113.53 doesn't answer")
 		}
 	}
 	r := runCLIContext(t, ctx, e, "connect", "--key", fakeSSKey)

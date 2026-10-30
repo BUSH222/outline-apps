@@ -102,7 +102,7 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 			}
 			return nil
 		},
-		Verify: e.verify(pair, log),
+		Verify: e.verify(verifyInput{pair: pair, direct: binder.StreamDialer(), firstHops: hops, log: log}),
 		Logger: log,
 	}
 	binder.SetLogger(log)

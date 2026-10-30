@@ -93,7 +93,7 @@ func runCLIContext(t *testing.T, ctx context.Context, e env, args ...string) res
 		e.openTUN = func() (tunnel.TUN, error) { return placeholderTUN{}, nil }
 	}
 	if e.verify == nil {
-		e.verify = func(*configregistry.TransportPair, *slog.Logger) func(context.Context) error {
+		e.verify = func(verifyInput) func(context.Context) error {
 			return func(context.Context) error { return nil }
 		}
 	}
