@@ -109,7 +109,7 @@ bypass:              # never through the VPN
   - "*.example.org"  # only subdomains (quote entries that start with *)
 vpn_only:            # only ever through the VPN; blocked while it's off after "lockdown"
   - example.com
-direct_dns: []       # optional: IPv4 DNS servers for bypass names (default: your network's)
+direct_dns: []       # optional: IPv4 DNS servers on your local network for bypass names (default: your network's)
 min_ttl: 60s         # learned addresses are kept at least this long
 max_ttl: 1h          # and at most this long
 ```
@@ -118,7 +118,7 @@ max_ttl: 1h          # and at most this long
 - If a name matches both lists, `vpn_only` wins.
 - Unknown keys, IP addresses and URLs are errors, so a typo can't silently drop a rule. `connect --dry-run` shows the rules it would apply.
 
-**How bypass works:** DNS questions for bypass names are answered by your network's own DNS server, outside the VPN; everything else is answered through the VPN. Each address in such an answer gets a route via your router (before the app sees the answer) for the rest of the session, so connections to it skip the VPN, from every app.
+**How bypass works:** DNS questions for bypass names are answered by your network's own DNS server, outside the VPN; everything else is answered through the VPN. A bypass name is never looked up through the VPN: if your network's DNS server doesn't answer, the lookup fails (the app sees "server failure") and is tried again on the app's next attempt. Each address in such an answer gets a route via your router (before the app sees the answer) for the rest of the session, so connections to it skip the VPN, from every app.
 
 **How VPN-only works:** vpn_only names are only ever looked up through the VPN, and their addresses never take the bypass path. If the rules have vpn_only entries, `connect` refuses a key whose transport sends some traffic directly (for example an `iptable` config with direct entries). The addresses learned for them are remembered for `lockdown`.
 
@@ -146,7 +146,8 @@ Bypass:
 - Connections opened before a name was resolved through the CLI stay on the VPN; apps that cache DNS (browsers keep names for about a minute) may use the VPN at first.
 - A bypass address shared with other sites (content networks) takes those sites off the VPN too, until you disconnect. A vpn_only entry always wins.
 - Addresses inside HTTPS-type DNS records (address hints) aren't learned.
-- On a network whose DNS server is on the internet rather than your router, bypass lookups go through the VPN instead (they still bypass; content networks may pick a server near the VPN server).
+- Bypass lookups only reach DNS servers on your local network (your router, a phone hotspot), the usual case. On a network whose DNS server is on the internet (for example `8.8.8.8` handed out by DHCP), bypass names can't be resolved and those sites don't load while connected; other sites work. The same applies to `direct_dns` entries outside your local network.
+- The CLI looks bypass names up ahead of time, at most 4 at a time. A name your network's DNS server doesn't answer is retried after 1 minute, then 2, 4, 8, 16, 32 minutes, then every `max_ttl` (1 hour by default).
 
 VPN-only and lockdown:
 - Addresses are only learned while connected. Until then, only the exact names in the hosts file are blocked; the hosts file has no wildcards, so `example.com` there doesn't block `www.example.com` (its addresses are blocked once learned).

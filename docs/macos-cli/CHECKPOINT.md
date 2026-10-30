@@ -55,7 +55,7 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 | # | Decision |
 |---|---|
 | D1 | VPN-off blocking: pf anchor + `/etc/hosts` |
-| D2 | Direct resolver for bypass domains: the captured system resolvers, with fallbacks (now: the user's manual DNS, else DHCP DNS, then the gateway, then `1.1.1.1`) |
+| D2 | Direct resolver for bypass domains: the user's manual DNS, else DHCP DNS, then the gateway. **Changed after M6:** no `1.1.1.1` fallback (unreachable from bound sockets), and **bypass names are never looked up through the tunnel**; a failed lookup gets SERVFAIL (FINDINGS 24) |
 | D3 | IPv6 off on the primary service during a session; restored exactly |
 | D4 | LaunchDaemon deferred |
 | D5 | DNS override via `networksetup` (persists across reboot; the recovery command is documented) |
@@ -161,7 +161,7 @@ Done (details in `FINDINGS.md` sections 15 and 16):
 
 **Rule from the developer:** DNS lookups for bypass names may go outside the VPN; lookups for vpn_only or ordinary names, and other traffic, may not. So the direct resolvers get **no** plain host routes.
 
-**Fixed after M4 (approved by the developer):** on a network whose DNS is a public resolver (not inside an excluded range), bound sockets can't reach it, so after a network change the transport couldn't look up the server's host name. Now, when the binder's lookup of a first-hop name fails, it dials the first-hop addresses resolved at connect time (`Binder.SetKnownAddrs`; they have host routes). No new route; nothing leaves the tunnel. Bypass lookups on such a network still fall back to the tunnel.
+**Fixed after M4 (approved by the developer):** on a network whose DNS is a public resolver (not inside an excluded range), bound sockets can't reach it, so after a network change the transport couldn't look up the server's host name. Now, when the binder's lookup of a first-hop name fails, it dials the first-hop addresses resolved at connect time (`Binder.SetKnownAddrs`; they have host routes). No new route; nothing leaves the tunnel. Bypass lookups on such a network fail (since FINDINGS 24, bypass names never go through the tunnel).
 
 ## 8. M5 (VPN-only list): where it stands
 

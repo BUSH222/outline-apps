@@ -349,3 +349,22 @@ Requested by the developer:
 - **No arguments** (what a Finder double-click runs) means `connect` with those files. Finder starts the program as the user in a Terminal window, so it replaces itself with `sudo -p "Password for %u: " EXE connect`; sudo asks for the password there and forwards Ctrl-C and the window's SIGHUP, which restore the network as before.
 - The error for an empty key avoids writing `ss://`-like examples: the redactor masks them, by design.
 - Tests use a temporary executable location and an `elevate` stub, so they never run the real `sudo` and never write next to the test binary.
+
+## 24. After M6: failed bypass lookups, and bypass names never through the VPN
+
+**Seen:** with a rules file of about twenty sites under `bypass:`, the log showed a warning about every 30 s: `a connection from the physical interface failed ... to=1.1.1.1:53 ... network is unreachable`. The debug log showed:
+- every bypass name looked up ahead of time failing at the same instant: `via 192.168.1.254:53: ... i/o timeout`, then `via 1.1.1.1:53: ... network is unreachable`, retried every 30 s;
+- an app's lookup of one name answered `SERVFAIL` by the router, then sent through the tunnel (the D2 fallback).
+
+**Diagnosis:**
+- The `1.1.1.1` fallback can never work: a bound socket can't reach an address without a route on the physical interface (section 16). No packet left the Mac; it only produced the warnings.
+- The router answered the same names in 5–9 ms when asked one at a time with `dig @192.168.1.254` (one name answered `SERVFAIL` either way). So the router drops bursts: at connect, every name was looked up at once, and the 30 s retries kept them in lockstep, so every retry was a burst too.
+- No request ever went to the websites themselves: only DNS lookups of their names, to the router, plus the tunnel fallback for app lookups the router failed.
+
+**Developer's decision:** bypass names are never looked up through the VPN (option b), the `1.1.1.1` fallback goes, and failed lookups back off.
+
+**Changes:**
+- `netbind`: no public fallback resolver; with no resolver at all, a lookup fails with a clear error (previously an empty list would have returned no address and no error).
+- `dnsrelay.Decide` replaces `Classify`: `ViaDirect` when every question is a bypass name, `ViaTunnel` when none is, `Refuse` when a query mixes them (so neither path carries a name it shouldn't). A failed direct lookup or a refused query gets a synthesized `SERVFAIL` with the query's ID and questions, over UDP and TCP; nothing goes through the tunnel.
+- Prefetch: at most 4 lookups in flight; a failure is retried after 1, 2, 4, 8, 16 and 32 minutes, then every `max_ttl`; a success (or an answer without addresses) resets the back-off.
+- Consequence, documented in `README.md`: on a network whose DNS server is outside the local ranges, bypass names can't be resolved while connected.

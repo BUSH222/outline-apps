@@ -225,7 +225,7 @@ New workflow file `.github/workflows/macos_cli.yml`:
 ## 12. Decisions (answered by the developer)
 
 1. **VPN-off blocking:** pf anchor plus `/etc/hosts`, as specified in 6.3.
-2. **Direct resolver for bypass domains:** the system resolvers captured at start (`scutil --dns`), over bound sockets. If none are usable, fall back to 1.1.1.1 (direct, bound). If a direct lookup fails, fall back to the tunnel resolver.
+2. **Direct resolver for bypass domains:** the system resolvers captured at start (`scutil --dns`), over bound sockets. ~~If none are usable, fall back to 1.1.1.1 (direct, bound). If a direct lookup fails, fall back to the tunnel resolver.~~ **Changed after M6 by the developer:** there is no public fallback (a bound socket can't reach one; FINDINGS 16), and a bypass name is **never** looked up through the tunnel: if the network's resolvers fail, the app gets "server failure" (FINDINGS 24).
 3. **IPv6:** disabled on the active service for the session (`-setv6off`) and restored exactly. The CLI warns if other services are active.
 4. **LaunchDaemon:** deferred. Lockdown state stays self-contained so a later daemon can re-apply it at boot.
 5. **DNS override mechanism:** `networksetup` (persists across reboot; the recovery command is documented).
