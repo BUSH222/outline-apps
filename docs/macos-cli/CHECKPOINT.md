@@ -1,4 +1,4 @@
-# macOS CLI: checkpoint (2026-10-30, M4: bypass fixed after manual test 7, waiting for manual test 8)
+# macOS CLI: checkpoint (2026-10-30, end of M4)
 
 Read this first if you are picking up this work. It says where things stand, which rules apply, what was learned the hard way, and what comes next. Details live in:
 
@@ -9,7 +9,7 @@ Read this first if you are picking up this work. It says where things stand, whi
 
 ## 1. What this is
 
-`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4; the first real test found that bypass needs host routes, now added, not yet re-tested). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
+`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4, confirmed on the real Mac). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
 
 Code: `client/go/outline/macoscli/`. Branch: `feat/macos-cli` on `origin` (the developer's fork `BUSH222/outline-apps`). `master` is untouched.
 
@@ -70,7 +70,7 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 | M1 CLI skeleton, key resolution, redaction, dry run | Done |
 | M2 Tunnel manager, state file, cleanup, crash safety | Done |
 | M3 Interface binding, real `connect` | **Done and confirmed on the real Mac** (manual tests 1–6: connect, both post-routing checks, disconnect, crash recovery, IPv6 leak check, a 2.4/5 GHz network switch, and a quick phone-hotspot switch) |
-| M4 Bypass list | **Manual test 7 failed (bound sockets can't get past the utun routes); fixed with host routes; waiting for manual test 8** (`MANUAL_TEST.md` section 7 again) |
+| M4 Bypass list | **Done and confirmed on the real Mac** (manual test 7 found that bypass needs host routes; manual test 8 passed with them) |
 | M5 VPN-only list | Not started |
 | M6 Universal artifact, README, final `MANUAL_TEST.md` | Partly done (CI already produces the signed universal artifact; README not written) |
 
@@ -151,9 +151,11 @@ Done (details in `FINDINGS.md` sections 15 and 16):
 - **Fix:** bypass addresses get journaled host routes via the gateway before the answer reaches the app (`tunnel/direct.go`, `syncDirectRoutes`). They follow network changes, are removed when an address turns vpn_only, and otherwise stay until disconnect.
 - `go.mod`: `golang.org/x/net` moved to the direct block (no `go.sum` change).
 
-Waiting for the developer: `MANUAL_TEST.md` section 7 again (manual test 8).
+- **Manual test 8 passed** (FINDINGS 17).
 
-Open question for the developer: should the direct resolvers (and the `1.1.1.1` fallback) get host routes too? Without them, a network whose DNS is a public resolver can't be reached from bound sockets (FINDINGS 16). With them, apps' own traffic to those resolvers skips the tunnel.
+**Rule from the developer:** DNS lookups for bypass names may go outside the VPN; lookups for vpn_only or ordinary names, and other traffic, may not. So the direct resolvers get **no** plain host routes.
+
+**Open gap and proposed fix (not started; ask before doing it):** on a network whose DNS is a public resolver (not inside an excluded range), bound sockets can't reach it. Bypass lookups then fall back to the tunnel (still fine), but after a network change the transport can't look up the server's host name, so the tunnel stays down until reconnect. Proposed fix: when the binder's lookup of a first-hop name fails, dial the first-hop addresses resolved at connect time (they already have host routes). No new route, nothing leaves the tunnel.
 
 ## 8. After M4
 

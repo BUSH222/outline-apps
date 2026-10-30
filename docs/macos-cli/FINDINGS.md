@@ -265,3 +265,15 @@ With the route in place, apps' connections to bypass addresses don't enter the u
 
 **Same cause, not fixed (known gaps):**
 - The direct resolvers are reachable only if they are inside an excluded range (a home router, a phone hotspot) or have a host route. A public DHCP or manual resolver (for example `8.8.8.8`) and the `1.1.1.1` fallback get "network is unreachable" too. Bypass lookups then fall back to the tunnel (D2), which still works. But the transport's own host-name lookups after a network change would fail on such a network. Giving those resolvers host routes would also send apps' own traffic to them around the tunnel; that trade-off is for the developer to decide.
+
+## 17. Manual test 8 (developer's Mac, 2026-10-30): bypass works
+
+With commit `1c059d3e` and `bypass: [icanhazip.com]`:
+- `curl -4 https://ipv4.icanhazip.com` printed the developer's own public IP; `curl -4 https://ifconfig.me` printed the server's.
+- The log showed both addresses learned (ahead of time for `icanhazip.com`, and again through the relay for `ipv4.icanhazip.com`), each followed by `added a direct route for a bypass address`.
+- `route -n get` for both addresses: the router, on `en1`.
+- DNS over UDP and TCP worked for the bypass name and for other names.
+
+**M4 is confirmed on the developer's Mac** for a bypass subdomain over TCP.
+
+**Developer's decision on DNS outside the tunnel (2026-10-30):** lookups for bypass names may leave outside the VPN; lookups for vpn_only or ordinary names, and other traffic, may not. Therefore the direct resolvers do **not** get plain host routes (a host route applies to every app, so apps' own DNS to that resolver would skip the tunnel). The gap from section 16 stays open; see CHECKPOINT section 7 for the proposed fix.
