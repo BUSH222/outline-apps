@@ -132,3 +132,22 @@ Verified so far:
   2. An ordinary connection (system DNS, default routes) works through the tunnel.
   3. If 2 fails: does DNS at `169.254.113.53` answer?
 - Bound-dial failures are now logged with their reason.
+
+## 10. Manual test 2 (developer's Mac, 2026-10-30): traffic flows
+
+**Passed:**
+- Both post-routing checks passed.
+- `curl -4 https://ifconfig.me` printed the VPN server's IP.
+- `dig` works through `169.254.113.53`.
+- The server's host route is on `en1` via the router.
+- The bound sockets left from `192.168.1.78` on `en1`.
+
+**IPv6:** `curl -6 https://ifconfig.me` succeeded and printed the VPN server's IPv4 address, even though IPv6 is off on Wi-Fi. The request left through the VPN server, so this is not a leak. A leak would show the developer's own ISP address. How an IPv6 connection reached the tunnel is not understood yet; the routing table and utun details have been requested.
+
+**Unclean exit:**
+- The test instructions piped the CLI into `tee`. Ctrl-C stopped `tee` too.
+- Go's default is to kill a program that writes to a closed stdout or stderr pipe (SIGPIPE). The first log line of the restore therefore killed the process halfway, and the next `connect` correctly reported and restored the leftovers.
+- **Fix:** the CLI takes SIGPIPE, so such writes fail with EPIPE and the restore completes. A test with a helper process shows Go's default dies and the fixed process survives. The manual test now uses `tee -i`.
+
+**Reconnect failure:** `route -n get -net 10.0.0.0/8` printed output with no `destination:` line, which aborted the connect. It rolled back before any route was touched. The cause is unknown.
+- **Fix:** an unreadable lookup is now logged with the raw output and the route is added anyway. That is safe, because an existing route makes the add fail with "File exists" and is then left alone.

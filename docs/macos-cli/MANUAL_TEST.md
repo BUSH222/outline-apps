@@ -65,7 +65,7 @@ netstat -rn -f inet | grep -E '^default|^<first hop IP>' > /tmp/before-defaults.
 Then connect:
 
 ```sh
-sudo ./outline-cli connect --key-file ~/.outline-key --log-level debug 2>&1 | tee /tmp/outline-cli.log
+sudo ./outline-cli connect --key-file ~/.outline-key --log-level debug 2>&1 | tee -i /tmp/outline-cli.log
 ```
 
 Expected, in order:
@@ -73,6 +73,8 @@ Expected, in order:
 2. `check 1/2 passed: the server is reachable with the tunnel routes in place`
 3. `check 2/2 passed: traffic flows through the tunnel`
 4. `connected: traffic goes through the tunnel (bound to en1)`
+
+(`tee -i` keeps capturing when you press Ctrl-C, so the disconnect messages are logged too.)
 
 These two checks run automatically once traffic is routed into the tunnel. If either fails, the CLI rolls every change back by itself and prints which check failed. Your network is then as before; no `cleanup` is needed.
 
@@ -89,7 +91,8 @@ In the second terminal:
 | DNS points at the tunnel | `scutil --dns \| grep -m2 nameserver` | `169.254.113.53` |
 | Names resolve | `dig +short example.com` | Addresses (answered through the tunnel) |
 | IPv6 is off on the service | `networksetup -getinfo Wi-Fi \| grep IPv6` | `IPv6: Off` |
-| No IPv6 leak | `curl -6 -s -m 5 https://ifconfig.me; echo $?` | Fails (non-zero exit) |
+| No IPv6 leak | `curl -6 -s -m 5 https://ifconfig.me; echo` | Fails, **or** prints the VPN server's address. A leak is your own ISP address (IPv4 or IPv6) |
+| How IPv6 is handled (diagnostic) | `curl -6 -sv -m 5 https://ifconfig.me 2>&1 \| grep -E 'Trying\|Connected'`, `netstat -rn -f inet6 \| grep -E '^default\|utun'`, `ifconfig utunN` | Send the output back |
 | Local network still works | `ping -c 2 <your router IP>` | Replies |
 | State file exists | `sudo cat /var/db/outline-cli/state.json` | Lists the routes, `prevDNS` and `prevIPv6` |
 
