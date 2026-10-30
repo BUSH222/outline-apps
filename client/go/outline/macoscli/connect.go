@@ -131,10 +131,11 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	for _, w := range domainRules.Warnings {
 		logger.Warn("rules file: " + w)
 	}
-	hops, err := firstHopAddrs(ctx, parsed.Pair, e.lookup)
+	hops, hopsByName, err := firstHopAddrs(ctx, parsed.Pair, e.lookup)
 	if err != nil {
 		return fail(err)
 	}
+	binder.SetKnownAddrs(hopsByName)
 
 	if !f.dryRun {
 		logger.Info("connecting", "key", resolved.Display, "transport", parsed.TransportType,

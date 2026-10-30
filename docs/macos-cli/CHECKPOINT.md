@@ -155,7 +155,7 @@ Done (details in `FINDINGS.md` sections 15 and 16):
 
 **Rule from the developer:** DNS lookups for bypass names may go outside the VPN; lookups for vpn_only or ordinary names, and other traffic, may not. So the direct resolvers get **no** plain host routes.
 
-**Open gap and proposed fix (not started; ask before doing it):** on a network whose DNS is a public resolver (not inside an excluded range), bound sockets can't reach it. Bypass lookups then fall back to the tunnel (still fine), but after a network change the transport can't look up the server's host name, so the tunnel stays down until reconnect. Proposed fix: when the binder's lookup of a first-hop name fails, dial the first-hop addresses resolved at connect time (they already have host routes). No new route, nothing leaves the tunnel.
+**Fixed after M4 (approved by the developer):** on a network whose DNS is a public resolver (not inside an excluded range), bound sockets can't reach it, so after a network change the transport couldn't look up the server's host name. Now, when the binder's lookup of a first-hop name fails, it dials the first-hop addresses resolved at connect time (`Binder.SetKnownAddrs`; they have host routes). No new route; nothing leaves the tunnel. Bypass lookups on such a network still fall back to the tunnel.
 
 ## 8. After M4
 

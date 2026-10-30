@@ -332,3 +332,33 @@ func (s *syncLog) String() string {
 	defer s.mu.Unlock()
 	return s.buf.String()
 }
+
+func TestStreamDialerFallsBackToKnownAddresses(t *testing.T) {
+	b, _ := recordingBinder()
+	var buf syncLog
+	b.SetLogger(slog.New(slog.NewTextHandler(&buf, nil)))
+	require.NoError(t, b.SetInterface("en0"))
+	// The network's resolver can't be reached (like a public resolver
+	// without a route on the physical interface).
+	dead, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	servers := []netip.AddrPort{netip.MustParseAddrPort(dead.LocalAddr().String())}
+	dead.Close()
+	b.resolvers.Store(&servers)
+	addr, accepted := listenTCP(t)
+	_, port, _ := net.SplitHostPort(addr)
+
+	_, err = b.StreamDialer().DialStream(ctx(t), net.JoinHostPort("server.example.test", port))
+	require.ErrorContains(t, err, "resolving server.example.test")
+
+	b.SetKnownAddrs(map[string][]netip.Addr{"Server.Example.Test": {netip.MustParseAddr("127.0.0.1")}})
+	conn, err := b.StreamDialer().DialStream(ctx(t), net.JoinHostPort("server.example.test", port))
+	require.NoError(t, err)
+	conn.Close()
+	<-accepted
+	require.Contains(t, buf.String(), "using its addresses from when the session started")
+
+	// Other names don't get the server's addresses.
+	_, err = b.StreamDialer().DialStream(ctx(t), net.JoinHostPort("other.example.test", port))
+	require.ErrorContains(t, err, "resolving other.example.test")
+}

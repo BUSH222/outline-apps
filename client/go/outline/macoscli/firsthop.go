@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"slices"
 	"time"
 
 	"localhost/client/go/outline/configregistry"
@@ -37,7 +38,9 @@ func defaultLookup(ctx context.Context, host string) ([]netip.Addr, error) {
 // firstHopAddrs resolves the transport's first hops (TCP and UDP) to IPv4
 // addresses. It runs before any DNS change, so it uses the system resolver.
 // IPv6-only servers are refused, because IPv6 is turned off during a session.
-func firstHopAddrs(ctx context.Context, pair *configregistry.TransportPair, lookup lookupFunc) ([]netip.Addr, error) {
+// It also returns the addresses of each host name, for the binder to fall
+// back on when it can't look the name up later.
+func firstHopAddrs(ctx context.Context, pair *configregistry.TransportPair, lookup lookupFunc) ([]netip.Addr, map[string][]netip.Addr, error) {
 	var hops []string
 	for _, hop := range []string{pair.StreamDialer.FirstHop, pair.PacketRelay.FirstHop} {
 		if hop != "" && (len(hops) == 0 || hops[0] != hop) {
@@ -45,10 +48,11 @@ func firstHopAddrs(ctx context.Context, pair *configregistry.TransportPair, look
 		}
 	}
 	if len(hops) == 0 {
-		return nil, nil
+		return nil, nil, nil
 	}
 
 	var addrs []netip.Addr
+	byName := map[string][]netip.Addr{}
 	seen := map[netip.Addr]bool{}
 	for _, hop := range hops {
 		host, _, err := net.SplitHostPort(hop)
@@ -63,7 +67,12 @@ func firstHopAddrs(ctx context.Context, pair *configregistry.TransportPair, look
 			found, err = lookup(lookupCtx, host)
 			cancel()
 			if err != nil {
-				return nil, fmt.Errorf("resolving the server %s: %w", host, err)
+				return nil, nil, fmt.Errorf("resolving the server %s: %w", host, err)
+			}
+			for _, a := range found {
+				if a = a.Unmap(); a.Is4() && !slices.Contains(byName[host], a) {
+					byName[host] = append(byName[host], a)
+				}
 			}
 		}
 		for _, a := range found {
@@ -75,7 +84,7 @@ func firstHopAddrs(ctx context.Context, pair *configregistry.TransportPair, look
 		}
 	}
 	if len(addrs) == 0 {
-		return nil, errors.New("the server has no IPv4 address; IPv6-only servers are not supported because IPv6 is turned off during a session")
+		return nil, nil, errors.New("the server has no IPv4 address; IPv6-only servers are not supported because IPv6 is turned off during a session")
 	}
-	return addrs, nil
+	return addrs, byName, nil
 }

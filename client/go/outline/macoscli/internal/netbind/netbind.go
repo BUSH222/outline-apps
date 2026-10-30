@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -60,6 +61,8 @@ type Binder struct {
 	ifIndex   atomic.Int64
 	ifName    atomic.Pointer[string]
 	resolvers atomic.Pointer[[]netip.AddrPort]
+	// known maps host names to addresses to use when a lookup fails.
+	known atomic.Pointer[map[string][]netip.Addr]
 
 	log          atomic.Pointer[slog.Logger]
 	lastWarnNano atomic.Int64
@@ -167,6 +170,29 @@ func (b *Binder) Resolvers() []netip.AddrPort {
 	return []netip.AddrPort{FallbackResolver}
 }
 
+// SetKnownAddrs sets addresses for host names (the server's, resolved when
+// connecting) to dial when looking a name up fails.
+//
+// Bound sockets can only reach a resolver that has a route on the physical
+// interface (FINDINGS 16): the router's DNS does, a public resolver set by a
+// network's DHCP doesn't. On such a network the server's name can't be looked
+// up after a network change, but its addresses from connect time still work:
+// they have host routes via the gateway.
+func (b *Binder) SetKnownAddrs(byName map[string][]netip.Addr) {
+	m := make(map[string][]netip.Addr, len(byName))
+	for name, addrs := range byName {
+		m[strings.ToLower(name)] = slices.Clone(addrs)
+	}
+	b.known.Store(&m)
+}
+
+func (b *Binder) knownAddrs(host string) []netip.Addr {
+	if m := b.known.Load(); m != nil {
+		return (*m)[strings.ToLower(host)]
+	}
+	return nil
+}
+
 // Control is a net.Dialer / net.ListenConfig Control function that binds the
 // socket to the current interface, or fails if there is none.
 func (b *Binder) Control(network, _ string, c syscall.RawConn) error {
@@ -203,7 +229,14 @@ func (b *Binder) dial(ctx context.Context, network, addr string) (net.Conn, erro
 	}
 	ips, err := b.LookupIPv4(ctx, host)
 	if err != nil {
-		return nil, fmt.Errorf("resolving %s: %w", host, err)
+		known := b.knownAddrs(host)
+		if len(known) == 0 || ctx.Err() != nil {
+			return nil, fmt.Errorf("resolving %s: %w", host, err)
+		}
+		if l := b.log.Load(); l != nil {
+			l.Warn("looking up the server failed; using its addresses from when the session started", "host", host, "err", err)
+		}
+		ips = known
 	}
 	var errs []error
 	for _, ip := range ips {
