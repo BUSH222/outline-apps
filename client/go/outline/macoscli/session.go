@@ -24,11 +24,17 @@ import (
 	"time"
 
 	"localhost/client/go/outline/configregistry"
+	"localhost/client/go/outline/macoscli/internal/dnsrelay"
+	"localhost/client/go/outline/macoscli/internal/ipcache"
 	"localhost/client/go/outline/macoscli/internal/netbind"
+	"localhost/client/go/outline/macoscli/internal/route"
+	"localhost/client/go/outline/macoscli/internal/rules"
 	"localhost/client/go/outline/macoscli/internal/state"
 	"localhost/client/go/outline/macoscli/internal/sysrouter"
 	"localhost/client/go/outline/macoscli/internal/tunnel"
 	"localhost/client/go/outline/vpn"
+
+	"golang.getoutline.org/sdk/network/packetrelay"
 )
 
 const (
@@ -69,7 +75,18 @@ func prepareSession(ctx context.Context, e env, log *slog.Logger) (func() error,
 
 // runSession brings the tunnel up, keeps it in sync with network changes, and
 // restores everything when ctx is canceled (Ctrl-C, SIGTERM, SIGHUP).
-func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregistry.TransportPair, binder *netbind.Binder, hops []netip.Addr) error {
+//
+// With domain rules, lwIP gets the transport wrapped by the router (see
+// newDomainRouting); the post-routing checks still use the bare transport.
+func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregistry.TransportPair, binder *netbind.Binder, hops []netip.Addr, domainRules *rules.Rules) error {
+	tunnelPair := pair
+	var dnsRelay *dnsrelay.Relay
+	if !domainRules.IsEmpty() {
+		var err error
+		if tunnelPair, dnsRelay, err = newDomainRouting(pair, binder, domainRules, log); err != nil {
+			return err
+		}
+	}
 	var transportStarted atomic.Bool
 	notify := func() {
 		if pair.PacketRelay.NotifyNetworkChanged != nil {
@@ -81,7 +98,7 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 		Store:   state.FileStore{Dir: e.stateDir},
 		OpenTUN: e.openTUN,
 		StartTransport: func(ctx context.Context, tun tunnel.TUN) (func(), error) {
-			stop, err := e.startTransport(ctx, tun, pair, log)
+			stop, err := e.startTransport(ctx, tun, tunnelPair, log)
 			if err == nil {
 				transportStarted.Store(true)
 			}
@@ -121,6 +138,9 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 		interval = defaultWatchInterval
 	}
 	go session.Watch(watchCtx, interval)
+	if dnsRelay != nil {
+		go dnsRelay.Prefetch(watchCtx, domainRules.ExactBypass())
+	}
 
 	<-ctx.Done()
 	stopWatch()
@@ -132,6 +152,48 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 	}
 	fmt.Fprintln(e.stdout, "disconnected: routes, DNS and IPv6 are restored")
 	return nil
+}
+
+// directUDPIdleTimeout closes a direct UDP association after this long
+// without sending, like the transport's own (configregistry).
+const directUDPIdleTimeout = 30 * time.Second
+
+// newDomainRouting wraps the transport with the domain rules: DNS to the
+// tunnel's address goes through the DNS relay, and traffic to addresses
+// learned for bypass domains goes directly on interface-bound sockets.
+func newDomainRouting(pair *configregistry.TransportPair, binder *netbind.Binder, r *rules.Rules, log *slog.Logger) (*configregistry.TransportPair, *dnsrelay.Relay, error) {
+	directPackets, err := packetrelay.NewPacketRelayFromPacketListener(binder.PacketListener(), directUDPIdleTimeout)
+	if err != nil {
+		return nil, nil, err
+	}
+	servers := binder.Resolvers
+	if len(r.DirectDNS) > 0 {
+		fixed := make([]netip.AddrPort, len(r.DirectDNS))
+		for i, a := range r.DirectDNS {
+			fixed[i] = netip.AddrPortFrom(a, 53)
+		}
+		servers = func() []netip.AddrPort { return fixed }
+	}
+	relay := &dnsrelay.Relay{
+		Rules: r,
+		Cache: ipcache.New(r.MinTTL, r.MaxTTL, nil),
+		Direct: &dnsrelay.Direct{
+			Packet:  binder.PacketDialer(),
+			Stream:  binder.StreamDialer(),
+			Servers: servers,
+		},
+		Log: log,
+	}
+	router := route.New(route.Config{
+		Inner:         pair,
+		DirectStream:  binder.StreamDialer(),
+		DirectPackets: directPackets,
+		DNS:           relay,
+		DNSAddr:       netip.AddrPortFrom(sysrouter.OutlineDNS, 53),
+		Log:           log,
+	})
+	log.Info("domain rules are on", "bypass", len(r.Bypass), "vpn_only", len(r.VPNOnly))
+	return router.Pair(), relay, nil
 }
 
 // startRemoteDevice connects the lwIP stack to the transport, waits for the

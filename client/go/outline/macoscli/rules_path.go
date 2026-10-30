@@ -15,9 +15,14 @@
 package main
 
 import (
+	"errors"
 	"fmt"
+	"io/fs"
+	"os"
 	"os/user"
 	"path/filepath"
+
+	"localhost/client/go/outline/macoscli/internal/rules"
 )
 
 // defaultRulesRelPath is the rules file location inside a home directory.
@@ -57,4 +62,24 @@ func resolveRulesPath(flagValue string, getenv func(string) string, lookupUser f
 		return rulesLocation{}, fmt.Errorf("HOME is not set; pass --rules PATH")
 	}
 	return rulesLocation{Path: filepath.Join(home, defaultRulesRelPath), Origin: "$HOME"}, nil
+}
+
+// loadRules reads the rules file. A missing default file means no rules; a
+// missing --rules file, or an invalid file, is an error. It also returns a
+// short status for display.
+func loadRules(loc rulesLocation) (*rules.Rules, string, error) {
+	info, err := os.Stat(loc.Path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist) && !loc.Explicit:
+		return rules.Empty(), "not found: running without rules", nil
+	case err != nil:
+		return nil, "", fmt.Errorf("rules file: %w", err)
+	case !info.Mode().IsRegular():
+		return nil, "", fmt.Errorf("rules file %s is not a regular file", loc.Path)
+	}
+	r, err := rules.Load(loc.Path)
+	if err != nil {
+		return nil, "", err
+	}
+	return r, fmt.Sprintf("found: %d bypass, %d vpn_only", len(r.Bypass), len(r.VPNOnly)), nil
 }

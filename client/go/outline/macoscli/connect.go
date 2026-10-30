@@ -23,7 +23,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/netip"
-	"os"
 	"strings"
 	"time"
 
@@ -32,6 +31,7 @@ import (
 	"localhost/client/go/outline/macoscli/internal/keys"
 	"localhost/client/go/outline/macoscli/internal/netbind"
 	"localhost/client/go/outline/macoscli/internal/redact"
+	"localhost/client/go/outline/macoscli/internal/rules"
 	"localhost/client/go/outline/macoscli/internal/state"
 	"localhost/client/go/outline/macoscli/internal/sysexec"
 	"localhost/client/go/outline/macoscli/internal/sysrouter"
@@ -120,13 +120,16 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	if parsed.HasReporter {
 		logger.Warn("this key includes a usage reporter, which outline-cli does not run")
 	}
-	rules, err := resolveRulesPath(f.rules, e.getenv, e.lookupUser)
+	rulesLoc, err := resolveRulesPath(f.rules, e.getenv, e.lookupUser)
 	if err != nil {
 		return fail(err)
 	}
-	rulesStatus, err := describeRulesFile(rules)
+	domainRules, rulesStatus, err := loadRules(rulesLoc)
 	if err != nil {
 		return fail(err)
+	}
+	for _, w := range domainRules.Warnings {
+		logger.Warn("rules file: " + w)
 	}
 	hops, err := firstHopAddrs(ctx, parsed.Pair, e.lookup)
 	if err != nil {
@@ -135,8 +138,8 @@ func runConnect(ctx context.Context, args []string, e env) int {
 
 	if !f.dryRun {
 		logger.Info("connecting", "key", resolved.Display, "transport", parsed.TransportType,
-			"rules", rules.Path+" ("+rulesStatus+")")
-		if err := runSession(ctx, e, logger, parsed.Pair, binder, hops); err != nil {
+			"rules", rulesLoc.Path+" ("+rulesStatus+")")
+		if err := runSession(ctx, e, logger, parsed.Pair, binder, hops, domainRules); err != nil {
 			return fail(err)
 		}
 		return exitOK
@@ -144,7 +147,8 @@ func runConnect(ctx context.Context, args []string, e env) int {
 
 	// Every line goes through the redactor as a last guard.
 	out := &redactingWriter{w: e.stdout, secrets: secrets}
-	printDryRun(out, raw, resolved, parsed, rules, rulesStatus, hops)
+	printDryRun(out, raw, resolved, parsed, rulesLoc, rulesStatus, hops)
+	printRules(out, domainRules)
 	fmt.Fprintf(out, "  state file:      %s\n", describeStateFile(state.FileStore{Dir: e.stateDir}))
 	if err := printPlan(ctx, out, e, hops, logger); err != nil {
 		return fail(err)
@@ -208,23 +212,7 @@ func describeStateFile(store state.FileStore) string {
 	}
 }
 
-// describeRulesFile says whether the rules file exists. A missing explicit
-// (--rules) file is an error.
-func describeRulesFile(loc rulesLocation) (string, error) {
-	info, err := os.Stat(loc.Path)
-	switch {
-	case err == nil && info.Mode().IsRegular():
-		return "found (rules are applied from milestone M4)", nil
-	case err == nil:
-		return "", fmt.Errorf("rules file %s is not a regular file", loc.Path)
-	case errors.Is(err, fs.ErrNotExist) && !loc.Explicit:
-		return "not found: running without rules", nil
-	default:
-		return "", fmt.Errorf("rules file: %w", err)
-	}
-}
-
-func printDryRun(w io.Writer, raw *keys.RawKey, resolved *keys.Resolved, parsed *keys.Parsed, rules rulesLocation, rulesStatus string, hops []netip.Addr) {
+func printDryRun(w io.Writer, raw *keys.RawKey, resolved *keys.Resolved, parsed *keys.Parsed, loc rulesLocation, rulesStatus string, hops []netip.Addr) {
 	pair := parsed.Pair
 	firstHop := resolved.FirstHop
 	if firstHop == "" {
@@ -247,7 +235,7 @@ func printDryRun(w io.Writer, raw *keys.RawKey, resolved *keys.Resolved, parsed 
 	}
 	fmt.Fprintf(w, "  first hop IPs:   %s\n", orNone(strings.Join(hopIPs, ", ")))
 	fmt.Fprintf(w, "  usage reporter:  %s\n", reporter)
-	fmt.Fprintf(w, "  rules file:      %s (%s; %s)\n", rules.Path, rules.Origin, rulesStatus)
+	fmt.Fprintf(w, "  rules file:      %s (%s; %s)\n", loc.Path, loc.Origin, rulesStatus)
 }
 
 func orNone(s string) string {
@@ -255,6 +243,22 @@ func orNone(s string) string {
 		return "none"
 	}
 	return s
+}
+
+// printRules shows the domain rules a real connect would apply.
+func printRules(w io.Writer, r *rules.Rules) {
+	if r.IsEmpty() {
+		return
+	}
+	fmt.Fprintf(w, "  bypass:          %s\n", orNone(strings.Join(r.Bypass, ", ")))
+	fmt.Fprintf(w, "  vpn_only:        %s (kept off the direct path; blocking while disconnected comes in M5)\n",
+		orNone(strings.Join(r.VPNOnly, ", ")))
+	direct := "the network's own (DHCP or as set on the service)"
+	if len(r.DirectDNS) > 0 {
+		direct = fmt.Sprint(r.DirectDNS)
+	}
+	fmt.Fprintf(w, "  bypass DNS:      %s\n", direct)
+	fmt.Fprintf(w, "  learned TTL:     %s to %s\n", r.MinTTL, r.MaxTTL)
 }
 
 // redactingWriter redacts everything written through it.

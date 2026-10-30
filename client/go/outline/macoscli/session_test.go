@@ -20,6 +20,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -188,5 +190,83 @@ func TestConnect_FailedVerificationRestoresTheNetwork(t *testing.T) {
 	require.Contains(t, r.stderr, "every change was rolled back")
 	require.Contains(t, r.stderr, "169.254.113.53 doesn't answer")
 	require.NotContains(t, r.stdout, "connected:")
+	require.Equal(t, baseline, mac.Snapshot())
+}
+
+func writeRules(t *testing.T, content string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "rules.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+	return path
+}
+
+// dnsDialErr dials the tunnel's DNS address over TCP through pair. Without
+// domain rules that goes to the transport, whose sockets the test refuses;
+// with them, the DNS relay takes the connection without opening any socket.
+func dnsDialErr(pair *configregistry.TransportPair) error {
+	conn, err := pair.StreamDialer.Dial(context.Background(), "169.254.113.53:53")
+	if err == nil {
+		conn.Close()
+	}
+	return err
+}
+
+func TestConnect_DomainRulesWrapTheTransport(t *testing.T) {
+	mac := fakemac.New()
+	baseline := mac.Snapshot()
+	e, ctx := sessionEnv(t, mac)
+	var transportErr, verifyErr error
+	var verifyPair *configregistry.TransportPair
+	e.startTransport = func(_ context.Context, _ tunnel.TUN, pair *configregistry.TransportPair, _ *slog.Logger) (func(), error) {
+		transportErr = dnsDialErr(pair)
+		// The rules keep the transport's own type and first hop.
+		require.Equal(t, configregistry.ConnTypeTunneled, pair.StreamDialer.ConnType)
+		require.Equal(t, "192.0.2.10:8388", pair.StreamDialer.FirstHop)
+		return func() {}, nil
+	}
+	e.verify = func(in verifyInput) func(context.Context) error {
+		return func(context.Context) error {
+			verifyPair = in.pair
+			verifyErr = dnsDialErr(in.pair)
+			return nil
+		}
+	}
+	r := runCLIContext(t, ctx, e, "connect", "--key", fakeSSKey, "--rules", writeRules(t, "bypass: [lichess.org]\n"))
+	require.Equal(t, exitOK, r.code, r.stderr)
+	require.Contains(t, r.stderr, "domain rules are on")
+	require.NoError(t, transportErr, "lwIP gets the router, which relays DNS itself")
+	require.NotNil(t, verifyPair)
+	require.ErrorContains(t, verifyErr, "test: no real sockets", "the checks use the bare transport")
+	require.Equal(t, baseline, mac.Snapshot())
+	requireNoSecrets(t, r)
+}
+
+func TestConnect_NoRulesKeepsTheBareTransport(t *testing.T) {
+	mac := fakemac.New()
+	e, ctx := sessionEnv(t, mac)
+	var transportErr error
+	e.startTransport = func(_ context.Context, _ tunnel.TUN, pair *configregistry.TransportPair, _ *slog.Logger) (func(), error) {
+		transportErr = dnsDialErr(pair)
+		return func() {}, nil
+	}
+	r := runCLIContext(t, ctx, e, "connect", "--key", fakeSSKey, "--rules", writeRules(t, "bypass: []\n"))
+	require.Equal(t, exitOK, r.code, r.stderr)
+	require.NotContains(t, r.stderr, "domain rules are on")
+	require.ErrorContains(t, transportErr, "test: no real sockets")
+}
+
+func TestConnect_InvalidRulesChangeNothing(t *testing.T) {
+	mac := fakemac.New()
+	baseline := mac.Snapshot()
+	e, ctx := sessionEnv(t, mac)
+	started := false
+	e.startTransport = func(context.Context, tunnel.TUN, *configregistry.TransportPair, *slog.Logger) (func(), error) {
+		started = true
+		return func() {}, nil
+	}
+	r := runCLIContext(t, ctx, e, "connect", "--key", fakeSSKey, "--rules", writeRules(t, "bypass: [https://lichess.org/]\n"))
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "not a domain name")
+	require.False(t, started)
 	require.Equal(t, baseline, mac.Snapshot())
 }

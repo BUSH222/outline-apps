@@ -285,6 +285,27 @@ func TestDryRun_ExplicitRulesFileMustExist(t *testing.T) {
 	requireNoSecrets(t, r)
 }
 
+func TestDryRun_ShowsTheRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+bypass: [Lichess.org, "*.cdn.example", private.secret.example]
+vpn_only: [secret.example]
+min_ttl: 30s
+`), 0o644))
+	r := runCLI(t, env{}, "connect", "--dry-run", "--key", fakeSSKey, "--rules", path)
+	require.Equal(t, exitOK, r.code, r.stderr)
+	require.Contains(t, r.stdout, "found: 3 bypass, 1 vpn_only")
+	require.Contains(t, r.stdout, "bypass:          lichess.org, *.cdn.example, private.secret.example\n")
+	require.Contains(t, r.stdout, "vpn_only:        secret.example (")
+	require.Contains(t, r.stdout, "learned TTL:     30s to 1h0m0s")
+	require.Contains(t, r.stderr, `private.secret.example\" is covered by vpn_only entry`)
+
+	require.NoError(t, os.WriteFile(path, []byte("bypass: [lichess.org]\nmin_tl: 30s\n"), 0o644))
+	r = runCLI(t, env{}, "connect", "--dry-run", "--key", fakeSSKey, "--rules", path)
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "min_tl")
+}
+
 func TestResolveRulesPath(t *testing.T) {
 	envOf := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
 	lookup := func(name string) (*user.User, error) {
