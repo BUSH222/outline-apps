@@ -277,3 +277,33 @@ With commit `1c059d3e` and `bypass: [icanhazip.com]`:
 **M4 is confirmed on the developer's Mac** for a bypass subdomain over TCP.
 
 **Developer's decision on DNS outside the tunnel (2026-10-30):** lookups for bypass names may leave outside the VPN; lookups for vpn_only or ordinary names, and other traffic, may not. Therefore the direct resolvers do **not** get plain host routes (a host route applies to every app, so apps' own DNS to that resolver would skip the tunnel). The gap from section 16 stays open; see CHECKPOINT section 7 for the proposed fix.
+
+## 18. After M4: server name lookups on networks with a public DNS server
+
+Approved by the developer: when the binder can't look up a first-hop host name (a public DHCP resolver isn't reachable from bound sockets, section 16), it dials the addresses resolved when the session started (`Binder.SetKnownAddrs`). They have host routes via the gateway, so no new route is needed and nothing else leaves the tunnel.
+
+## 19. M5 notes (VPN-only list and lockdown)
+
+**Part A (connected):**
+- `connect` refuses `vpn_only` entries with a transport whose TCP or UDP isn't `tunneled` (for example an `iptable` with direct entries), per D8.
+- vpn_only addresses never go direct (the router since M4), and lose a bypass host route at once if one exists (shared addresses).
+- Names listed without `*.` are looked up ahead of time **through the tunnel only** (DNS over TCP to `169.254.113.53`, which the transport forwards to its resolver), for A and AAAA, and again at 80% of the TTL. This follows the developer's rule: vpn_only lookups never leave the VPN.
+- Every address learned for a vpn_only domain is kept in `/var/db/outline-cli/vpn_only.json` (0600), with its domain and when it was last seen; entries unseen for 30 days are dropped. The server's addresses are never kept.
+
+**Part B (`lockdown`/`unlock`), D1:**
+- **pf:** anchor `com.apple/outline-cli`, loaded from `/var/db/outline-cli/anchor.conf` with `pfctl -a com.apple/outline-cli -f FILE`. The table is written inline (`table <outline_vpn_only> persist { ... }`), not from a separate file as planned: the anchor file already holds everything and is reloaded on every change.
+  - Disconnected form: `block drop out quick from any to <outline_vpn_only>`.
+  - Connected form: `pass out quick on utunN from any to <outline_vpn_only>` first. No address family, so both IPv4 and IPv6 are covered. No physical interface is named.
+  - pf is enabled with `pfctl -E`; its reference token (printed on standard error, hence `Call.CombinedOutput`) is kept in `lockdown.json` and released by `unlock` with `pfctl -X`.
+  - If `pfctl -s rules` shows no `anchor "com.apple/*"`: with an empty main ruleset (nothing loaded since boot), `/etc/pf.conf` is loaded, provided it has that anchor; a non-empty main ruleset without it is someone else's setup, and lockdown fails with an error instead of changing it. **N4 is still unverified** on the real Mac.
+- **hosts:** a block between `# BEGIN outline-cli ...` and `# END outline-cli` with `0.0.0.0 NAME` and `:: NAME` for each entry without `*.`. It's a pure text transform (golden-tested), written atomically, keeping the file's mode; a one-time backup goes to `hosts.backup`.
+- `lockdown.json` is written **before** anything is installed, so an interrupted lockdown is finished by `cleanup`.
+- **Lifecycle:**
+  - `connect`: after the routes are up, the connected form, then the hosts block is removed. If that fails, the vpn_only domains stay blocked (fails closed) and a warning is logged.
+  - Disconnect: the disconnected form and the hosts block, even if restoring the network failed.
+  - `cleanup`: re-installs both whenever lockdown is on (including after a reboot, which re-enables pf with a new token). It never removes them.
+  - A connect that recovers a crashed session re-installs them before fetching the key.
+  - `lockdown` and `unlock` take the instance lock, so they refuse while `connect` runs.
+- `lockdown` never resolves names itself (that would leak the lookups); the table holds what sessions learned.
+- `pfctl` reads (`-s info`, `-s rules`, `-a ANCHOR -s rules`) are on the dry-run allowlist; every other `pfctl` call counts as a change. The simulated Mac models pf (enable references, main ruleset, anchors, reboot).
+- Tests never touch `/etc/hosts` or `/etc/pf.conf`: the lockdown manager has no default paths, and the test environment always passes temporary files.

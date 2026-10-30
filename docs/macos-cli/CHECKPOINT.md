@@ -1,4 +1,4 @@
-# macOS CLI: checkpoint (2026-10-30, end of M4)
+# macOS CLI: checkpoint (2026-10-30, M5 code done, waiting for manual test 9)
 
 Read this first if you are picking up this work. It says where things stand, which rules apply, what was learned the hard way, and what comes next. Details live in:
 
@@ -9,7 +9,7 @@ Read this first if you are picking up this work. It says where things stand, whi
 
 ## 1. What this is
 
-`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4, confirmed on the real Mac). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
+`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4, confirmed on the real Mac) and a VPN-only list with `lockdown`/`unlock` (M5, code done, not yet tested on the real Mac). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
 
 Code: `client/go/outline/macoscli/`. Branch: `feat/macos-cli` on `origin` (the developer's fork `BUSH222/outline-apps`). `master` is untouched.
 
@@ -71,7 +71,7 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 | M2 Tunnel manager, state file, cleanup, crash safety | Done |
 | M3 Interface binding, real `connect` | **Done and confirmed on the real Mac** (manual tests 1–6: connect, both post-routing checks, disconnect, crash recovery, IPv6 leak check, a 2.4/5 GHz network switch, and a quick phone-hotspot switch) |
 | M4 Bypass list | **Done and confirmed on the real Mac** (manual test 7 found that bypass needs host routes; manual test 8 passed with them) |
-| M5 VPN-only list | Not started |
+| M5 VPN-only list | **Code done, gate passed locally; waiting for manual test 9** (`MANUAL_TEST.md` section 8) |
 | M6 Universal artifact, README, final `MANUAL_TEST.md` | Partly done (CI already produces the signed universal artifact; README not written) |
 
 ## 5. How the code fits together
@@ -104,6 +104,8 @@ internal/rules     rules file (strict YAML) and the label-suffix matcher; vpn_on
 internal/ipcache   address -> {class, domain, expiry}, TTL clamped to [min_ttl, max_ttl]
 internal/dnsrelay  Classify/Snoop (CNAME chains), Framer (TCP), Direct (bound resolvers), Relay
                    (StreamConn for DNS over TCP, Prefetch)
+internal/lockdown  pf anchor + /etc/hosts block for vpn_only domains: Lock / Unlock / Connected /
+                   Disconnected / Learn; lockdown.json, vpn_only.json, anchor.conf, hosts.backup
 internal/route     the router lwIP gets when rules exist: DNS -> dnsrelay, bypass address -> direct
                    (no fallback), everything else -> the transport; UDP associations like dnsintercept's
 internal/dnstest   DNS message builders for tests
@@ -157,28 +159,33 @@ Done (details in `FINDINGS.md` sections 15 and 16):
 
 **Fixed after M4 (approved by the developer):** on a network whose DNS is a public resolver (not inside an excluded range), bound sockets can't reach it, so after a network change the transport couldn't look up the server's host name. Now, when the binder's lookup of a first-hop name fails, it dials the first-hop addresses resolved at connect time (`Binder.SetKnownAddrs`; they have host routes). No new route; nothing leaves the tunnel. Bypass lookups on such a network still fall back to the tunnel.
 
-## 8. After M4
+## 8. M5 (VPN-only list): where it stands
 
-- **M5 (VPN-only):**
-  - Part A: `vpn_only` IPs always go through the tunnel and fail closed; refuse non-tunneled transports (D8).
-  - Part B: `lockdown`/`unlock` with a pf anchor `com.apple/outline-cli`. Rules: `block drop out quick to <table>`, plus `pass out quick on utunN to <table>` while connected. First-hop IPs never go in the table.
-  - Plus a marked `/etc/hosts` block. `cleanup` re-installs both; only `unlock` removes them.
-  - Fake-executor tests of the exact `pfctl` invocations; golden tests for the hosts edits.
+Done (details in `FINDINGS.md` section 19):
+- Part A: D8 refusal (`connect.go: checkVPNOnlyTransport`); vpn_only names looked up ahead of time through the tunnel only (A and AAAA); learned addresses kept in `vpn_only.json` (`session.go` glue: `vpnOnlyAddrs` -> `lockdown.Manager.Learn`).
+- Part B: `lockdown [--rules] [--dry-run]` and `unlock` (`lockdown.go`); `connect` switches an active lockdown to the connected form and back; `cleanup` and crash recovery re-install it; only `unlock` removes it.
+- Tests: golden anchor and hosts text; exact `pfctl` sequences for lock, connect, learn, disconnect, unlock, reboot plus cleanup, and a foreign main ruleset; CLI tests for every command, using temporary hosts files only.
+
+Waiting for the developer: `MANUAL_TEST.md` section 8 (manual test 9), which also checks N4 (the anchor loads and is evaluated without editing `/etc/pf.conf`).
+
+## 8b. After M5
+
 - **M6:**
-  - `docs/macos-cli/README.md`: install (`chmod +x`, `xattr -dr com.apple.quarantine` for the CI download; not needed for local builds), the sudo key/rules guidance, recovery, and limits.
+  - `docs/macos-cli/README.md`: install (`chmod +x`, `xattr -dr com.apple.quarantine` for the CI download; not needed for local builds), the sudo key/rules guidance, recovery (including the lockdown), and limits.
   - Finish `MANUAL_TEST.md`.
 - **Known gaps to mention or fix:**
   - On 2026-10-30 a dry run on the developer's Mac saw `utun4` as the primary default route (some other VPN, or the CLI itself, was up). `connect` doesn't refuse to start while another tunnel owns the default route; it would bind to that utun. Ask, then consider refusing a utun as the physical interface.
   - A dead transport isn't detected while connected (traffic stops until Ctrl-C).
   - Only the primary service's DNS/IPv6 are changed (the CLI warns when several interfaces are active).
   - A usage reporter in a key is ignored with a warning.
+  - pf rules don't survive a reboot until `cleanup` or `lockdown` runs (D4: a LaunchDaemon could do that).
 
 ## 9. Gate checklist (run before every commit)
 
 ```sh
 gofmt -l client/go/outline/macoscli                      # must print nothing
 go vet ./client/go/outline/macoscli/...
-(cd client/go/outline/macoscli/internal && GOOS=linux CGO_ENABLED=0 go vet ./rules ./ipcache ./dnsrelay ./route ./dnstest)
+(cd client/go/outline/macoscli/internal && GOOS=linux CGO_ENABLED=0 go vet ./rules ./ipcache ./dnsrelay ./route ./dnstest ./tunnel ./lockdown ./fakemac)
 go test -race -count=1 ./client/go/outline/macoscli/...
 GOARCH=arm64 CGO_ENABLED=1 CC="clang -arch arm64" \
   CGO_CFLAGS="-O2 -g -mmacosx-version-min=12.0" CGO_LDFLAGS="-mmacosx-version-min=12.0" \

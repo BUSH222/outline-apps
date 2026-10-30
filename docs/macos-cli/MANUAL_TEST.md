@@ -2,7 +2,7 @@
 
 This is the only end-to-end check of the VPN. Unit tests and CI cover the logic and the build, but they never touch a real network. Run the steps in order and note the result of each one.
 
-Scope so far (M4): connect, disconnect, crash recovery, network changes, and the bypass list (section 7). VPN-only blocking comes in M5, and this document will grow with it.
+Scope (M5): connect, disconnect, crash recovery, network changes, the bypass list (section 7) and the VPN-only list with lockdown (section 8).
 
 ## 0. If your network breaks: recovery
 
@@ -25,7 +25,15 @@ Try these in order. Each step is safe to repeat.
    ```
    Host routes for bypass addresses (`netstat -rn -f inet` shows them as single addresses via your router, flags `UGHS`) are harmless if left over, and a reboot clears them; `cleanup` removes them too.
    If you had set DNS servers or a manual IPv6 address yourself before connecting, the previous values are in the state file: `sudo cat /var/db/outline-cli/state.json` (see `prevDNS` and `prevIPv6`).
-4. Last resort: reboot. Routes are cleared by a reboot, but **the DNS setting is not**, so still run the `networksetup -setdnsservers` line from step 3.
+4. **A site stays blocked** although you ran `unlock`, or `outline-cli` is gone: remove the lockdown by hand.
+   ```sh
+   sudo outline-cli unlock                          # first choice
+   sudo pfctl -a com.apple/outline-cli -F all       # by hand: the pf rules
+   sudo nano /etc/hosts                             # and delete the lines from "# BEGIN outline-cli" to "# END outline-cli"
+   sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
+   ```
+   A copy of `/etc/hosts` from before the first lockdown is in `/var/db/outline-cli/hosts.backup`.
+5. Last resort: reboot. Routes are cleared by a reboot, but **the DNS setting is not**, so still run the `networksetup -setdnsservers` line from step 3.
 
 ## 1. Before you start
 
@@ -173,13 +181,67 @@ If the bypass check fails, send the `grep` output and the route check.
 - Addresses that appear only as hints inside HTTPS (type 65) DNS records aren't learned.
 - `vpn_only` entries are already kept off the direct path while connected, but blocking them while disconnected (`lockdown`) comes in M5.
 
-## 8. Things to note (not failures)
+## 8. VPN-only list and lockdown
+
+Domains under `vpn_only:` only ever go through the VPN. After `sudo outline-cli lockdown` they are also blocked while the VPN is off, until `sudo outline-cli unlock`. This test uses `ifconfig.me`, which shows whose address a request comes from.
+
+1. Add a `vpn_only` entry to the rules file:
+   ```sh
+   cat > ~/.config/outline-cli/rules.yaml <<'EOF'
+   bypass:
+     - icanhazip.com
+   vpn_only:
+     - ifconfig.me
+   EOF
+   ```
+2. **While connected (part A).** Connect as in step 3 (`--log-level debug`). Expected soon after `connected:`: `learned an address domain=ifconfig.me ... class=vpn_only` for its IPv4 address (and IPv6, if it has one). The name is looked up through the tunnel only. Then:
+   - `curl -4 -s https://ifconfig.me; echo` prints the **server's** IP.
+   - Disconnect (Ctrl-C). `sudo ls /var/db/outline-cli` lists `vpn_only.json` (the learned addresses).
+3. **Lock down.**
+   ```sh
+   sudo ./outline-cli lockdown --dry-run     # shows the hosts lines and the pf rules, with the learned address(es)
+   sudo ./outline-cli lockdown
+   ```
+   Expected: `lockdown is on: while the VPN is off, ifconfig.me are blocked (N learned address(es) in pf, ...)`, with N at least 1.
+4. **While disconnected:**
+
+| Check | Command | Expected |
+|---|---|---|
+| The site is blocked | `curl -4 -s -m 5 https://ifconfig.me; echo " exit=$?"` | Fails (non-zero exit) |
+| By name (hosts) | `dscacheutil -q host -a name ifconfig.me` | `ip_address: 0.0.0.0` |
+| By address (pf), even with the name resolved by hand | `curl -4 -s -m 5 --resolve ifconfig.me:443:<address from the dry run> https://ifconfig.me; echo " exit=$?"` | Fails (non-zero exit) |
+| **N4:** the anchor is loaded | `sudo pfctl -a com.apple/outline-cli -s rules` | `block drop out quick from any to <outline_vpn_only>` |
+| The table holds the address | `sudo pfctl -a com.apple/outline-cli -t outline_vpn_only -T show` | The address(es) from the dry run |
+| pf evaluates the anchor | `sudo pfctl -s rules 2>/dev/null \| grep com.apple` | `anchor "com.apple/*" all` |
+| Other sites still work | `curl -4 -s https://ipv4.icanhazip.com` | Your normal IP |
+
+5. **Connect again** (as in step 3). Expected: `lockdown: vpn_only domains are reachable through the tunnel utun=utunN`. Then:
+   - `curl -4 -s https://ifconfig.me; echo` prints the server's IP;
+   - `grep -c outline-cli /etc/hosts` prints `0` (the hosts block is out while connected);
+   - `sudo pfctl -a com.apple/outline-cli -s rules` shows `pass out quick on utunN ...` before the block.
+6. **Crash while connected:** `sudo pkill -9 -f 'outline-cli connect'`. Then:
+   - `curl -4 -s -m 5 --resolve ifconfig.me:443:<address> https://ifconfig.me; echo " exit=$?"` still fails: the pass rule names a utun that no longer exists.
+   - `sudo ./outline-cli cleanup` prints `lockdown re-installed: ifconfig.me are blocked while the VPN is off`, and `grep -c outline-cli /etc/hosts` is back to `2` (the two marker lines).
+7. **Unlock:** `sudo ./outline-cli unlock`. Expected: `lockdown is off ...`; `curl -4 -s https://ifconfig.me` prints your normal IP; `grep -c outline-cli /etc/hosts` prints `0`; `sudo pfctl -a com.apple/outline-cli -s rules` prints nothing.
+8. Optional, reboot: lock down, reboot, and repeat the checks of step 4. Expected: the name check still blocks (the hosts file survives), but **the address check passes**: a reboot clears pf. `sudo ./outline-cli cleanup` puts the pf rules back.
+
+### Limits of the VPN-only list
+
+- **Addresses are only learned while connected**, from DNS answers through the tunnel. Until a domain has been used (or looked up ahead of time) in a session, pf has nothing to block for it; only the hosts entry stops it.
+- **The hosts block only covers the names exactly as listed:** `example.com` blocks `example.com`, not `www.example.com` (hosts has no wildcards). Subdomains are blocked by address once their addresses were learned. `*.example.com` entries only work through learned addresses.
+- **Browsers with DNS-over-HTTPS** skip the hosts file; the pf block still applies to known addresses.
+- **Content networks change addresses**, and a shared address blocks other sites on it too while the VPN is off. `unlock` removes everything.
+- **A reboot clears the pf rules** (the hosts block stays). Run `sudo outline-cli cleanup` (or `lockdown`) after a reboot. Doing this at boot automatically is a possible later addition (a LaunchDaemon).
+- `lockdown` and `unlock` refuse to run while `connect` is running. After editing `vpn_only`, run `lockdown` again.
+- A `vpn_only` entry makes `connect` refuse a key whose transport sends some traffic directly (for example an `iptable` config with direct entries).
+
+## 9. Things to note (not failures)
 
 - If the server goes down while you're connected, traffic just stops. The CLI doesn't detect a dead transport yet. Ctrl-C restores the network.
 - Only the primary service's DNS and IPv6 are changed. With several active interfaces the CLI warns that the others may leak.
 - A server given as a host name is resolved before connecting, using your normal DNS.
 
-## 9. If connect fails or traffic doesn't flow
+## 10. If connect fails or traffic doesn't flow
 
 Send back:
 - `/tmp/outline-cli.log` (it is redacted, but check it before sending)
@@ -197,6 +259,6 @@ sudo tcpdump -ni en1 -c 10 host <first hop IP>            # run curl again meanw
 sudo tcpdump -ni utunN -c 10                              # and what enters the tunnel (utunN from the log)
 ```
 
-## 10. What to send back
+## 11. What to send back
 
 For each step: pass or fail, and for failures the terminal output (use `--log-level debug`) plus the output of the check that failed. Mask anything you consider private (your public IP, network names).

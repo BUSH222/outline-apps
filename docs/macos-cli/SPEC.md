@@ -157,6 +157,7 @@ Interpretation: when the VPN is **on**, these domains are reachable normally (al
     - Tunnel traffic exits to the proxy server's IP, so it is unaffected. First-hop IPs are never added to the table.
   - **`/etc/hosts` entries** (a marked block) mapping those domains to `0.0.0.0` and `::`, removed on `connect` and restored on disconnect. Hosts entries have no wildcards, so only listed names are covered.
   - If the CLI crashes, the pf block stays (fail closed). After a `kill -9` while connected, the hosts block is missing until `cleanup` runs.
+  - **As built (M5):** the table is written inline in the anchor file; `lockdown` never resolves names (vpn_only lookups must not leave the VPN), so the table holds the addresses learned through the tunnel while connected (`/var/db/outline-cli/vpn_only.json`); `lockdown` and `unlock` refuse while `connect` runs; pf is enabled with a reference token (`pfctl -E`/`-X`). See `FINDINGS.md` section 19.
   - `cleanup` restores routes and DNS and **re-installs** the block rules (hosts and the pf disconnected form). It must never remove them; only `unlock` does.
   - Both need root. IPv4 and IPv6 must be covered.
 - Document the limits: DoH in browsers, hardcoded IPs, CDN IP churn, not surviving reboot unless a LaunchDaemon is added later. The agent should present these trade-offs and the alternatives (a NetworkExtension content filter is out of scope; `includeAllNetworks` is whole-device, not per-domain) in its plan.
