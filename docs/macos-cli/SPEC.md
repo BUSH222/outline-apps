@@ -110,7 +110,7 @@ On `connect`:
 6. IPv6: the stock Apple path appears to be IPv4-only, so IPv6 would leak. Disable IPv6 on the active service for the session (`networksetup -setv6off`) and restore the exact previous setting on exit, including Manual address, prefix and router. This only covers the active service; the CLI warns if others are active.
 7. If lockdown is active (6.3): remove the hosts block and load the pf anchor's "connected" form.
 8. **Last:** flush caches (`dscacheutil -flushcache; killall -HUP mDNSResponder`), after both the DNS and hosts changes.
-9. Poll for network changes (gateway or interface change, for example switching Wi-Fi). On a change: update the bound interface index and resolvers, re-apply what is needed, and call `NotifyNetworkChanged()` on the transport's packet relay.
+9. Poll for network changes (gateway or interface change, for example switching Wi-Fi). On a change: update the bound interface index, re-apply what is needed, and call `NotifyNetworkChanged()` on the transport's packet relay. Re-read the direct resolvers on **every** change, including one on the same service (another Wi-Fi network). While connected, `scutil` only shows the tunnel's DNS, so use the user's manual DNS servers if set, else the DHCP servers from `ipconfig getpacket IFACE`, then the gateway, and `1.1.1.1` last.
 
 On exit (SIGINT, SIGTERM, SIGHUP) or `cleanup`, restore everything from the state file in this order:
 1. DNS and IPv6.

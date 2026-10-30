@@ -151,3 +151,28 @@ Verified so far:
 
 **Reconnect failure:** `route -n get -net 10.0.0.0/8` printed output with no `destination:` line, which aborted the connect. It rolled back before any route was touched. The cause is unknown.
 - **Fix:** an unreadable lookup is now logged with the raw output and the route is added anyway. That is safe, because an existing route makes the add fail with "File exists" and is then left alone.
+
+## 11. Manual test 3 (developer's Mac, 2026-10-30): reconnect and network switch
+
+**Passed:**
+- Ctrl-C restored everything (with `tee -i`), and an immediate reconnect worked.
+- `cleanup --dry-run` afterwards found nothing to clean up.
+
+**IPv6, resolved, no leak:**
+- `curl -6 https://ifconfig.me` connected to `::ffff:34.160.111.145`, an IPv4-mapped address. `ifconfig.me` has no IPv6 address, so this was IPv4 through the tunnel.
+- `netstat -rn -f inet6` showed no IPv6 default route for Wi-Fi, and the CLI's `utun4` had no IPv6 address. The `utun0`–`utun6` IPv6 routes belong to macOS's own system tunnels.
+- The manual test now uses an IPv6-only host.
+
+**`route -n get` printing nothing:**
+- On a reconnect, every lookup of a route that doesn't exist printed nothing on stdout and exited 0; the "not in table" error goes to stderr.
+- Empty output now simply means "no such route". Non-empty unexpected output is still logged.
+
+**Bug, hotspot switch (same Wi-Fi service, new network):**
+- The transport resolves its server's host name through the direct resolvers. Those were only refreshed when the network *service* changed.
+- A hotspot over Wi-Fi keeps the service and the interface, so lookups kept going to the old router `192.168.1.254` ("can't assign requested address"), and the tunnel stayed down.
+- The Go resolver also kept retrying the first server, never the others.
+
+**Fixes:**
+- The direct resolvers are recomputed on every network change: the user's manual DNS if set, else the new DHCP servers from `ipconfig getpacket` (`scutil` only shows the tunnel's DNS while connected), then the gateway, then `1.1.1.1`.
+- Lookups try each resolver in turn, with a 3 s limit each.
+- Tests reproduce the hotspot case, and a fake DNS server on loopback shows the fallback to the next resolver.

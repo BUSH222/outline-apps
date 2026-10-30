@@ -91,8 +91,7 @@ In the second terminal:
 | DNS points at the tunnel | `scutil --dns \| grep -m2 nameserver` | `169.254.113.53` |
 | Names resolve | `dig +short example.com` | Addresses (answered through the tunnel) |
 | IPv6 is off on the service | `networksetup -getinfo Wi-Fi \| grep IPv6` | `IPv6: Off` |
-| No IPv6 leak | `curl -6 -s -m 5 https://ifconfig.me; echo` | Fails, **or** prints the VPN server's address. A leak is your own ISP address (IPv4 or IPv6) |
-| How IPv6 is handled (diagnostic) | `curl -6 -sv -m 5 https://ifconfig.me 2>&1 \| grep -E 'Trying\|Connected'`, `netstat -rn -f inet6 \| grep -E '^default\|utun'`, `ifconfig utunN` | Send the output back |
+| No IPv6 leak | `curl -6 -s -m 5 https://ipv6.icanhazip.com; echo " exit=$?"` | Fails (non-zero exit). `ipv6.icanhazip.com` only has an IPv6 address; printing one would be a leak. (`ifconfig.me` has no IPv6 address, so `curl -6` to it falls back to IPv4 through the tunnel and proves nothing.) |
 | Local network still works | `ping -c 2 <your router IP>` | Replies |
 | State file exists | `sudo cat /var/db/outline-cli/state.json` | Lists the routes, `prevDNS` and `prevIPv6` |
 
@@ -126,8 +125,9 @@ curl -4 -s https://ifconfig.me; echo        # your normal IP again
 While connected:
 
 1. Switch networks, for example from Wi-Fi to an iPhone hotspot or Ethernet, or turn Wi-Fi off and on.
-2. Within a few seconds the log shows `the network changed`. Check:
-   - `curl -4 -s https://ifconfig.me` still shows the server's IP.
+2. Within a few seconds of the new network coming up, the log shows `the network changed` (a short `the network is gone` before it is normal). Check:
+   - `curl -4 -s https://ifconfig.me` shows the server's IP again within a few seconds.
+   - The log shows no repeated `a connection from the physical interface failed` after the change. Such warnings naming the *old* network's DNS server were the hotspot bug of manual test 3.
    - `networksetup -getdnsservers <new service>` shows `169.254.113.53`, and the old service is back to its own setting.
 3. Disconnect (Ctrl-C) and check that both services are restored.
 
