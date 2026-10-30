@@ -1,4 +1,4 @@
-# macOS CLI: checkpoint (2026-10-30, M4 code done, waiting for manual test 7)
+# macOS CLI: checkpoint (2026-10-30, M4: bypass fixed after manual test 7, waiting for manual test 8)
 
 Read this first if you are picking up this work. It says where things stand, which rules apply, what was learned the hard way, and what comes next. Details live in:
 
@@ -9,7 +9,7 @@ Read this first if you are picking up this work. It says where things stand, whi
 
 ## 1. What this is
 
-`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4; code done, not yet tested on the real Mac). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
+`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4; the first real test found that bypass needs host routes, now added, not yet re-tested). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
 
 Code: `client/go/outline/macoscli/`. Branch: `feat/macos-cli` on `origin` (the developer's fork `BUSH222/outline-apps`). `master` is untouched.
 
@@ -70,7 +70,7 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 | M1 CLI skeleton, key resolution, redaction, dry run | Done |
 | M2 Tunnel manager, state file, cleanup, crash safety | Done |
 | M3 Interface binding, real `connect` | **Done and confirmed on the real Mac** (manual tests 1–6: connect, both post-routing checks, disconnect, crash recovery, IPv6 leak check, a 2.4/5 GHz network switch, and a quick phone-hotspot switch) |
-| M4 Bypass list | **Code done, gate passed locally; waiting for manual test 7** (check 3 line and `MANUAL_TEST.md` section 7) |
+| M4 Bypass list | **Manual test 7 failed (bound sockets can't get past the utun routes); fixed with host routes; waiting for manual test 8** (`MANUAL_TEST.md` section 7 again) |
 | M5 VPN-only list | Not started |
 | M6 Universal artifact, README, final `MANUAL_TEST.md` | Partly done (CI already produces the signed universal artifact; README not written) |
 
@@ -95,7 +95,8 @@ internal/sysexec   the ONLY place that runs commands: Real (LC_ALL=C, fixed PATH
 internal/sysrouter builds macOS commands and parses netstat, networksetup, scutil, route get, ipconfig getpacket, ifconfig;
                    IsReadOnly is the dry-run allowlist
 internal/state     state.json in /var/db/outline-cli (atomic, 0600), flock instance lock, MemStore
-internal/tunnel    Up / Down / Cleanup / CheckNetwork / Watch: the whole system-change sequence
+internal/tunnel    Up / Down / Cleanup / CheckNetwork / Watch: the whole system-change sequence;
+                   direct.go: RouteDirect / UnrouteDirect (bypass host routes, purpose "bypass")
 internal/netbind   IP_BOUND_IF sockets (IPv4 only, fail closed), LookupIPv4 with resolver failover, dial logging
 internal/fakemac   simulated Mac for tests: routes (incl. cloned ones and stale source addresses), DNS, IPv6,
                    services, networks, failure and crash injection
@@ -108,7 +109,7 @@ internal/route     the router lwIP gets when rules exist: DNS -> dnsrelay, bypas
 internal/dnstest   DNS message builders for tests
 ```
 
-**With rules** (`session.go: newDomainRouting`), lwIP gets `router.Pair()`; `verifyTunnel` keeps the bare pair. Without rules (missing file or empty lists), nothing is wrapped. Pre-resolution starts once connected.
+**With rules** (`session.go: newDomainRouting`), lwIP gets `router.Pair()`; `verifyTunnel` keeps the bare pair. Without rules (missing file or empty lists), nothing is wrapped. Pre-resolution starts once connected. Every DNS answer calls `relay.OnLearn` before it is passed on; `syncDirectRoutes` then gives bypass addresses a host route via the gateway (and takes it from addresses that turned vpn_only).
 
 **Connect order** (`tunnel.Up`):
 1. Capture the default routes, service, DNS, scutil resolvers, IPv6 and interface addresses. **Write the state file.**
@@ -140,21 +141,19 @@ internal/dnstest   DNS message builders for tests
 9. **cgo objects default to the host macOS as their minimum version.** `build-local.sh` passes `-mmacosx-version-min=12.0` in `CGO_CFLAGS`/`CGO_LDFLAGS` (`MACOSX_DEPLOYMENT_TARGET` alone isn't in Go's cache key).
 10. `go test -race` prints `ld: warning: ... malformed LC_DYSYMTAB`. It is harmless.
 11. Upstream's "Go Backend Test" runs `go test ./client/...` on Ubuntu, which includes these packages. Keep darwin-only code behind build tags with stubs. Our workflow's `linux-tests` job guards this.
+12. **A socket bound to the primary interface can't reach an address whose only matching routes are on the utun** (`network is unreachable`); the plain `default` route isn't used for it. Bound sockets work only towards destinations with a route on the physical interface (host routes, excluded ranges). That's why bypass addresses get host routes (manual test 7).
 
 ## 7. M4 (bypass list): where it stands
 
-Done (details and design choices in `FINDINGS.md` section 15):
-- **Step 0:** a third post-routing check, log-only: `check 3/3 (informational)` compares the public address 1.1.1.1 reports (`whoami.cloudflare`, CH TXT over TCP) through a bound socket with the one through the tunnel. Not run on the real Mac yet.
+Done (details in `FINDINGS.md` sections 15 and 16):
 - `internal/rules`, `internal/ipcache`, `internal/dnsrelay`, `internal/route`, wired in `session.go`; the dry run prints the rules.
+- **Manual test 7:** DNS, learning and the routing decision worked, but the bound socket got `network is unreachable`: binding alone doesn't get past the utun's `0/1` and `128/1`. Step 0's check (check 3) is removed again; it had served its purpose.
+- **Fix:** bypass addresses get journaled host routes via the gateway before the answer reaches the app (`tunnel/direct.go`, `syncDirectRoutes`). They follow network changes, are removed when an address turns vpn_only, and otherwise stay until disconnect.
 - `go.mod`: `golang.org/x/net` moved to the direct block (no `go.sum` change).
-- `MANUAL_TEST.md`: check 3 explained in step 3; new section 7 (bypass test and limits).
-- Gate: gofmt, vet (amd64, arm64, and Linux for the pure packages), `go test -race`, license check, `build-local.sh`, and a dry run with a fake key and sample rules all pass.
 
-Waiting for the developer:
-- the `check 3/3` line from a connect;
-- the results of `MANUAL_TEST.md` section 7.
+Waiting for the developer: `MANUAL_TEST.md` section 7 again (manual test 8).
 
-If check 3 fails (bound sockets don't escape the utun without a host route): add `/32` gateway routes for learned bypass addresses, journaled like the other routes (a new purpose, re-created on network changes like the first-hop routes, removed when they expire). The router's decision logic stays the same.
+Open question for the developer: should the direct resolvers (and the `1.1.1.1` fallback) get host routes too? Without them, a network whose DNS is a public resolver can't be reached from bound sockets (FINDINGS 16). With them, apps' own traffic to those resolvers skips the tunnel.
 
 ## 8. After M4
 

@@ -218,7 +218,7 @@ With commit `bd37e0bf`, switching between the router's 2.4 GHz and 5 GHz network
 **Step 0: does binding alone escape the tunnel?** Bypass traffic goes to arbitrary addresses with no host route, so this had to be checked before relying on it.
 - A plain bound `connect` can't tell: lwIP accepts every TCP connection itself, so a socket that wrongly entered the utun would also "connect".
 - Instead, a third post-routing check (log-only, never fatal) asks `1.1.1.1` for `whoami.cloudflare` (class CH, type TXT, over TCP), which answers with the asker's public address. It asks once through a bound socket and once through the tunnel, and only says whether the two differ; the addresses aren't logged.
-- **Not yet run on the real Mac.** If it fails, bypass needs `/32` gateway routes for learned addresses (journaled like the other routes) instead of binding alone.
+- **Answered by manual test 7 (section 16): binding alone does not work.** The check was then removed again (it would only warn on every connect), and bypass addresses get host routes.
 
 **Dependency:** `golang.org/x/net v0.44.0` was already in the local module cache by M4, so nothing was fetched. `go mod tidy` only moved it from the indirect block to the direct one; `go.sum` is unchanged.
 
@@ -232,7 +232,7 @@ With commit `bd37e0bf`, switching between the router's 2.4 GHz and 5 GHz network
   - **TCP:** queries are read from the 2-byte-framed stream; replies are written back as they arrive. **Deviation from the plan:** replies on the shared tunnel connection are not matched by ID. Each reply carries its own question (that is what is learned from), replies go back on the same client connection, and RFC 7766 lets them arrive out of order; the client matches IDs itself.
   - Truncated (TC) replies are passed on unchanged; the client retries over TCP, which takes the same path.
 - `internal/route`: wraps the parsed `TransportPair`, keeping its connection type, first hop and `NotifyNetworkChanged`.
-  - Bypass addresses use the binder's dialer, or a direct UDP relay on the binder's listener (30 s idle timeout), with **no fallback** to the tunnel.
+  - Bypass addresses use the binder's dialer, or a direct UDP relay on the binder's listener (30 s idle timeout), with **no fallback** to the tunnel. Since manual test 7 this path only carries connections lwIP already had before an address's host route existed; new connections follow the route and never enter the utun.
   - vpn_only and unknown addresses use the transport; vpn_only never goes direct, even when the tunnel fails.
   - Host names (only from the transport's own checks) go through the transport.
   - UDP associations are modeled on the SDK's `dnsintercept`: sub-associations are created on first use and replaced if they end; the association closes itself once nothing is active, so lwIP releases the app's socket, as upstream does.
@@ -244,3 +244,24 @@ With commit `bd37e0bf`, switching between the router's 2.4 GHz and 5 GHz network
 - The others (DoH, connections opened before a mapping exists, shared CDN addresses, OS and app DNS caches) are listed in `MANUAL_TEST.md` section 7.
 
 **vpn_only in M4:** such addresses are already kept off the direct path. Refusing a transport that isn't fully tunneled (D8) and `lockdown`/`unlock` come in M5.
+
+## 16. Manual test 7 (developer's Mac, 2026-10-30): bypass blocked the domain
+
+**What happened:**
+- The VPN itself worked as before (the server's IP from `ifconfig.me`, DNS over UDP and TCP).
+- `curl -4 https://ipv4.icanhazip.com` printed nothing, and the site didn't load in Firefox either.
+- The log shows every step up to the connect working: the name was resolved ahead of time and again through the relay, its addresses were learned as bypass, and the connection was routed to the direct path. Then: `dial tcp4 <address>:443: connect: network is unreachable` from the socket bound to `en1`.
+
+**Cause:** on macOS, a socket bound to the primary interface with `IP_BOUND_IF` doesn't fall back to that interface's unscoped `default` route when a more specific route on another interface matches. Here the utun's `0/1` and `128/1` match every address, so the kernel refuses the connection. It only worked so far for destinations with a route on `en1` of their own: the server's host route, and the router's DNS inside the excluded `192.168/16`. This answers the open question from manual test 1 (N1 holds only with a matching route on the physical interface).
+
+**Fix:** every address learned for a bypass domain gets a host route via the physical gateway (`route -n add -host ADDR GATEWAY`, purpose `bypass`):
+- added **before the DNS answer is passed to the app** (the relay's `OnLearn` hook runs synchronously), so the app's first connection already uses it;
+- journaled in the state file like every other route, so `cleanup` and crash recovery remove it;
+- moved to the new gateway on every network change, and added once the network is back if it was learned while offline;
+- removed at once if the address is later learned for a `vpn_only` domain;
+- otherwise kept until disconnect, not expired with the DNS TTL, so long-lived connections aren't cut.
+
+With the route in place, apps' connections to bypass addresses don't enter the utun at all, and the CLI's own bound sockets reach them too.
+
+**Same cause, not fixed (known gaps):**
+- The direct resolvers are reachable only if they are inside an excluded range (a home router, a phone hotspot) or have a host route. A public DHCP or manual resolver (for example `8.8.8.8`) and the `1.1.1.1` fallback get "network is unreachable" too. Bypass lookups then fall back to the tunnel (D2), which still works. But the transport's own host-name lookups after a network change would fail on such a network. Giving those resolvers host routes would also send apps' own traffic to them around the tunnel; that trade-off is for the developer to decide.

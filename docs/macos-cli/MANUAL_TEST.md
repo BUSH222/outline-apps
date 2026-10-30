@@ -23,6 +23,7 @@ Try these in order. Each step is safe to repeat.
    sudo route -n delete -host 169.254.113.53
    sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
    ```
+   Host routes for bypass addresses (`netstat -rn -f inet` shows them as single addresses via your router, flags `UGHS`) are harmless if left over, and a reboot clears them; `cleanup` removes them too.
    If you had set DNS servers or a manual IPv6 address yourself before connecting, the previous values are in the state file: `sudo cat /var/db/outline-cli/state.json` (see `prevDNS` and `prevIPv6`).
 4. Last resort: reboot. Routes are cleared by a reboot, but **the DNS setting is not**, so still run the `networksetup -setdnsservers` line from step 3.
 
@@ -70,19 +71,13 @@ sudo ./outline-cli connect --key-file ~/.outline-key --log-level debug 2>&1 | te
 
 Expected, in order:
 1. `the server is reachable`
-2. `check 1/3 passed: the server is reachable with the tunnel routes in place`
-3. `check 2/3 passed: traffic flows through the tunnel`
-4. a line starting with `check 3/3 (informational)` (see below)
-5. `connected: traffic goes through the tunnel (bound to en1)`
+2. `check 1/2 passed: the server is reachable with the tunnel routes in place`
+3. `check 2/2 passed: traffic flows through the tunnel`
+4. `connected: traffic goes through the tunnel (bound to en1)`
 
 (`tee -i` keeps capturing when you press Ctrl-C, so the disconnect messages are logged too.)
 
-These checks run automatically once traffic is routed into the tunnel. If check 1 or 2 fails, the CLI rolls every change back by itself and prints which check failed. Your network is then as before; no `cleanup` is needed.
-
-**Check 3 never stops the connect, but please send its line back.** It tells whether a socket bound to Wi-Fi leaves through Wi-Fi even when its destination has no route of its own (the bypass list depends on that). It asks 1.1.1.1 for your public address once through Wi-Fi and once through the tunnel and compares the two; the addresses are not logged.
-- `check 3/3 (informational) passed: ...`: good, the bypass list can work.
-- `... failed: ... went through the tunnel` or `... failed: a bound socket can't reach ...`: the bypass list won't work yet (bypass connections will fail, they won't leak). The next step would be adding routes for bypass addresses.
-- `... is inconclusive` or `skipped`: send the line too.
+These two checks run automatically once traffic is routed into the tunnel. If either fails, the CLI rolls every change back by itself and prints which check failed. Your network is then as before; no `cleanup` is needed.
 
 Note: **`ping` proves nothing here.** The CLI's network stack answers pings to any address itself, in under a millisecond. Use `curl` or `dig`.
 
@@ -150,29 +145,31 @@ Domains under `bypass:` never use the VPN. Each entry covers the domain and all 
    EOF
    ```
 2. Dry run: `./outline-cli connect --dry-run --key-file ~/.outline-key`. Expected: `rules file: ... (found: 1 bypass, 0 vpn_only)` and `bypass: icanhazip.com`.
-3. Connect as in step 3, with `--log-level debug`. Expected, before the checks: `domain rules are on bypass=1 vpn_only=0`. Within a second or two after `connected:`, the log shows `learned an address domain=icanhazip.com ... class=bypass` (the name is resolved ahead of time through your network's DNS).
+3. Connect as in step 3, with `--log-level debug`. Expected, before the checks: `domain rules are on bypass=1 vpn_only=0`. Within a second or two after `connected:`, the log shows `learned an address domain=icanhazip.com ... class=bypass` (the name is resolved ahead of time through your network's DNS), each followed by `added a direct route for a bypass address`.
 4. In the second terminal:
 
 | Check | Command | Expected |
 |---|---|---|
 | A bypass subdomain goes direct | `curl -4 -s https://ipv4.icanhazip.com` | **Your normal public IP** (from the baseline in step 1) |
 | Everything else stays on the VPN | `curl -4 -s https://ifconfig.me; echo` | The server's IP |
-| The log shows why | `grep -E 'domain=(ipv4\.)?icanhazip.com' /tmp/outline-cli.log \| tail -5` | `learned an address ... class=bypass` and `bypass: connected directly ... to=<address>:443` |
+| The log shows why | `grep -E 'learned an address\|direct route' /tmp/outline-cli.log \| tail -6` | `learned an address domain=ipv4.icanhazip.com ... class=bypass` and `added a direct route for a bypass address addr=<address>` |
+| The bypass addresses have routes | `for a in $(dig +short ipv4.icanhazip.com); do route -n get $a \| grep -E 'gateway\|interface'; done` | Your router and `en1` for each address, **not** utunN |
 | DNS over UDP for a bypass name | `dig +short ipv4.icanhazip.com` | Addresses (answered by your network's DNS) |
 | DNS over TCP for a bypass name | `dig +tcp +short ipv4.icanhazip.com` | The same kind of answer |
 | DNS for other names still works | `dig +short example.com` | Addresses (answered through the tunnel) |
 
-5. Optional: switch networks as in section 6, then repeat the first two checks. The bypass check should show the **new** network's public IP.
-6. Disconnect (Ctrl-C) and run the checks from section 4.
+5. Optional: switch networks as in section 6, then repeat the first two checks and the route check. The bypass check should show the **new** network's public IP, and the routes the new router.
+6. Disconnect (Ctrl-C) and run the checks from section 4. Also: `grep -c UGHS /tmp/before-routes.txt` and `netstat -rn -f inet | grep -c UGHS` should print the same number (the server's and the bypass host routes are gone).
 
-If the bypass check times out instead of printing your IP, send the `check 3/3` line and the `grep` output: that is the case check 3 is there to catch.
+If the bypass check fails, send the `grep` output and the route check.
 
 ### Limits of the bypass list
 
 - **The CLI only sees DNS that goes to the system resolver.** Browsers with DNS-over-HTTPS ("secure DNS") or apps with a hard-coded resolver resolve the name themselves, so their connections to bypass domains still use the VPN. curl and Safari use the system resolver.
 - **Only connections opened after the name was resolved through the CLI go direct.** The CLI flushes the macOS DNS cache when it connects, but apps with their own cache (browsers keep names for about a minute) may connect through the VPN at first. Connections that were open before connecting stay where they are.
 - **Shared addresses:** if a bypass domain shares a content network address with another site, connections to that other site go direct too. A `vpn_only` entry always wins over this.
-- **Addresses are remembered for the DNS answer's lifetime**, kept between `min_ttl` (default 60s) and `max_ttl` (default 1h). After that, a connection to the same address goes through the VPN until the name is looked up again. Names written without `*.` are looked up again by the CLI before they expire.
+- **Each bypass address gets a host route via your router until you disconnect**, so every connection to it skips the VPN, from any app, even after the DNS answer expires. That keeps long-lived connections (a game's socket, for example) from being cut. An address later learned for a `vpn_only` domain loses its route at once.
+- Names written without `*.` are looked up again by the CLI before their answers expire, so new addresses get routes too. (`min_ttl` and `max_ttl` bound how long the CLI's own address list keeps an answer.)
 - Addresses that appear only as hints inside HTTPS (type 65) DNS records aren't learned.
 - `vpn_only` entries are already kept off the direct path while connected, but blocking them while disconnected (`lockdown`) comes in M5.
 
