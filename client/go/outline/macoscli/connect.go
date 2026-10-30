@@ -131,6 +131,9 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	for _, w := range domainRules.Warnings {
 		logger.Warn("rules file: " + w)
 	}
+	if err := checkVPNOnlyTransport(parsed.Pair, domainRules); err != nil {
+		return fail(err)
+	}
 	hops, hopsByName, err := firstHopAddrs(ctx, parsed.Pair, e.lookup)
 	if err != nil {
 		return fail(err)
@@ -246,13 +249,28 @@ func orNone(s string) string {
 	return s
 }
 
+// checkVPNOnlyTransport refuses vpn_only rules with a transport that sends
+// some traffic directly (for example an iptable with direct entries): those
+// domains must only ever go through the tunnel (decision D8).
+func checkVPNOnlyTransport(pair *configregistry.TransportPair, r *rules.Rules) error {
+	if len(r.VPNOnly) == 0 {
+		return nil
+	}
+	tcp, udp := pair.StreamDialer.ConnType, pair.PacketRelay.ConnType
+	if tcp == configregistry.ConnTypeTunneled && udp == configregistry.ConnTypeTunneled {
+		return nil
+	}
+	return fmt.Errorf("the rules file has vpn_only entries, but this key's transport doesn't send everything through the server (TCP %s, UDP %s); remove the vpn_only entries or use a key that tunnels everything",
+		keys.ConnTypeName(tcp), keys.ConnTypeName(udp))
+}
+
 // printRules shows the domain rules a real connect would apply.
 func printRules(w io.Writer, r *rules.Rules) {
 	if r.IsEmpty() {
 		return
 	}
 	fmt.Fprintf(w, "  bypass:          %s\n", orNone(strings.Join(r.Bypass, ", ")))
-	fmt.Fprintf(w, "  vpn_only:        %s (kept off the direct path; blocking while disconnected comes in M5)\n",
+	fmt.Fprintf(w, "  vpn_only:        %s (only through the tunnel; blocked while disconnected after: sudo outline-cli lockdown)\n",
 		orNone(strings.Join(r.VPNOnly, ", ")))
 	direct := "the network's own (DHCP or as set on the service)"
 	if len(r.DirectDNS) > 0 {

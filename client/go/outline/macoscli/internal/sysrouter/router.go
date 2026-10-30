@@ -88,6 +88,13 @@ func IsReadOnly(c sysexec.Call) bool {
 		return len(c.Args) == 1 && c.Args[0] == "--dns"
 	case "route":
 		return len(c.Args) >= 2 && c.Args[0] == "-n" && c.Args[1] == "get"
+	case "pfctl":
+		// Only showing: "-s info", "-s rules", "-a ANCHOR -s rules".
+		a := c.Args
+		if len(a) == 4 && a[0] == "-a" {
+			a = a[2:]
+		}
+		return len(a) == 2 && a[0] == "-s" && (a[1] == "info" || a[1] == "rules")
 	case "networksetup":
 		if len(c.Args) == 0 {
 			return false

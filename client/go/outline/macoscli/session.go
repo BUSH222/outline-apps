@@ -35,6 +35,8 @@ import (
 	"localhost/client/go/outline/vpn"
 
 	"golang.getoutline.org/sdk/network/packetrelay"
+	"golang.getoutline.org/sdk/transport"
+	"golang.org/x/net/dns/dnsmessage"
 )
 
 const (
@@ -69,6 +71,13 @@ func prepareSession(ctx context.Context, e env, log *slog.Logger) (func() error,
 	}
 	if restored != nil {
 		log.Warn("restored the network left behind by a previous session that didn't exit cleanly", "pid", restored.PID)
+		// The crashed session may have left the lockdown in its connected
+		// form (hosts block removed). Put it back now, in case this connect
+		// fails before it switches the lockdown over itself.
+		if err := e.lockdownManager(log).Disconnected(ctx); err != nil {
+			unlock()
+			return nil, fmt.Errorf("re-installing the lockdown failed: %w; fix it with: sudo outline-cli cleanup", err)
+		}
 	}
 	return unlock, nil
 }
@@ -87,13 +96,29 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 			return err
 		}
 	}
+	lk := e.lockdownManager(log)
+	if len(domainRules.VPNOnly) > 0 {
+		// The server's addresses must never end up in the lockdown's block.
+		if err := lk.SetFirstHops(hops); err != nil {
+			log.Warn("recording the server's addresses for the lockdown failed", "err", err)
+		}
+	}
 	// live is the session once it is up. Bypass addresses learned from DNS
-	// get host routes via the physical gateway through it.
+	// get host routes via the physical gateway through it; vpn_only addresses
+	// are remembered for the lockdown.
 	var live atomic.Pointer[tunnel.Session]
 	if dnsRelay != nil {
 		dnsRelay.OnLearn = func(addrs []netip.Addr) {
 			if s := live.Load(); s != nil {
 				syncDirectRoutes(s, dnsRelay.Cache, addrs, log)
+			}
+			if vpnOnly := vpnOnlyAddrs(dnsRelay.Cache, addrs); len(vpnOnly) > 0 {
+				// Not urgent: while connected, the tunnel carries them anyway.
+				go func() {
+					if err := lk.Learn(context.Background(), vpnOnly); err != nil {
+						log.Warn("recording vpn_only addresses for the lockdown failed", "err", err)
+					}
+				}()
 			}
 		}
 	}
@@ -139,6 +164,10 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 		return err
 	}
 	live.Store(session)
+	if err := lk.Connected(ctx, session.State().UTun); err != nil {
+		// Fails closed: the disconnected form still blocks the vpn_only domains.
+		log.Warn("lockdown: letting vpn_only domains through the tunnel failed, so they stay blocked", "err", err)
+	}
 	name, _ := binder.Interface()
 	fmt.Fprintf(e.stdout, "connected: traffic goes through the tunnel (bound to %s). Press Ctrl-C to disconnect.\n", name)
 
@@ -151,6 +180,13 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 	go session.Watch(watchCtx, interval)
 	if dnsRelay != nil {
 		go dnsRelay.Prefetch(watchCtx, domainRules.ExactBypass())
+		// vpn_only names are only ever looked up through the tunnel.
+		if names := domainRules.ExactVPNOnly(); len(names) > 0 {
+			tunnelDNS := &dnsrelay.StreamExchanger{Dial: func(ctx context.Context) (transport.StreamConn, error) {
+				return pair.StreamDialer.Dial(ctx, netip.AddrPortFrom(sysrouter.OutlineDNS, 53).String())
+			}}
+			go dnsRelay.PrefetchVia(watchCtx, names, tunnelDNS, dnsmessage.TypeA, dnsmessage.TypeAAAA)
+		}
 	}
 
 	<-ctx.Done()
@@ -158,11 +194,28 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 	log.Info("disconnecting")
 	downCtx, cancel := context.WithTimeout(context.Background(), disconnectTimeout)
 	defer cancel()
-	if err := session.Down(downCtx); err != nil {
-		return fmt.Errorf("restoring the network failed: %w; fix it with: sudo outline-cli cleanup", err)
+	downErr := session.Down(downCtx)
+	// Even if the network couldn't be fully restored: the block must come back.
+	lockErr := lk.Disconnected(downCtx)
+	if downErr != nil || lockErr != nil {
+		return fmt.Errorf("restoring the network failed: %w; fix it with: sudo outline-cli cleanup", errors.Join(downErr, lockErr))
 	}
 	fmt.Fprintln(e.stdout, "disconnected: routes, DNS and IPv6 are restored")
 	return nil
+}
+
+// vpnOnlyAddrs returns the addresses whose class is vpn_only, with their domain.
+func vpnOnlyAddrs(cache *ipcache.Cache, addrs []netip.Addr) map[netip.Addr]string {
+	var out map[netip.Addr]string
+	for _, a := range addrs {
+		if class, domain := cache.Lookup(a); class == rules.VPNOnly {
+			if out == nil {
+				out = map[netip.Addr]string{}
+			}
+			out[a] = domain
+		}
+	}
+	return out
 }
 
 // directUDPIdleTimeout closes a direct UDP association after this long

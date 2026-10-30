@@ -115,29 +115,7 @@ func (d *Direct) exchangeOne(ctx context.Context, server netip.AddrPort, query [
 	defer stop()
 
 	if overTCP {
-		if _, err := conn.Write(frame(query)); err != nil {
-			return nil, err
-		}
-		var f Framer
-		buf := make([]byte, 4096)
-		for {
-			n, err := conn.Read(buf)
-			msgs, ferr := f.Push(buf[:n])
-			for _, m := range msgs {
-				if isResponseTo(m, query) {
-					return m, nil
-				}
-			}
-			if ferr != nil {
-				return nil, ferr
-			}
-			if err != nil {
-				if errors.Is(err, io.EOF) {
-					err = errors.New("closed without an answer")
-				}
-				return nil, err
-			}
-		}
+		return roundTripTCP(conn, query)
 	}
 
 	if _, err := conn.Write(query); err != nil {
@@ -154,6 +132,64 @@ func (d *Direct) exchangeOne(ctx context.Context, server netip.AddrPort, query [
 			return append([]byte(nil), buf[:n]...), nil
 		}
 	}
+}
+
+// roundTripTCP sends a query on a DNS-over-TCP connection and reads frames
+// until the response to it arrives.
+func roundTripTCP(conn net.Conn, query []byte) ([]byte, error) {
+	if _, err := conn.Write(frame(query)); err != nil {
+		return nil, err
+	}
+	var f Framer
+	buf := make([]byte, 4096)
+	for {
+		n, err := conn.Read(buf)
+		msgs, ferr := f.Push(buf[:n])
+		for _, m := range msgs {
+			if isResponseTo(m, query) {
+				return m, nil
+			}
+		}
+		if ferr != nil {
+			return nil, ferr
+		}
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				err = errors.New("closed without an answer")
+			}
+			return nil, err
+		}
+	}
+}
+
+// StreamExchanger sends each query over a new DNS-over-TCP connection from
+// Dial, for example through the tunnel.
+type StreamExchanger struct {
+	Dial DialFunc
+	// Timeout bounds one query; 0 means DefaultServerTimeout.
+	Timeout time.Duration
+}
+
+// Exchange implements Exchanger. It always uses TCP.
+func (s *StreamExchanger) Exchange(ctx context.Context, query []byte, _ bool) ([]byte, error) {
+	timeout := s.Timeout
+	if timeout == 0 {
+		timeout = DefaultServerTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	conn, err := s.Dial(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+	stop := context.AfterFunc(ctx, func() { conn.Close() })
+	defer stop()
+	reply, err := roundTripTCP(conn, query)
+	if err != nil && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	return reply, err
 }
 
 // Relay classifies queries, resolves bypass names directly and learns the

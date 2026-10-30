@@ -33,6 +33,10 @@ import (
 type Call struct {
 	Name string
 	Args []string
+	// CombinedOutput makes a successful Run return standard error after
+	// standard output, for tools that report results on standard error
+	// (pfctl -E prints its token there).
+	CombinedOutput bool
 }
 
 // Cmd builds a Call.
@@ -127,6 +131,9 @@ func (r Real) Run(ctx context.Context, c Call) ([]byte, error) {
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
+	if c.CombinedOutput {
+		cmd.Stderr = &stdout
+	}
 	err := cmd.Run()
 	if err != nil {
 		exitCode := -1

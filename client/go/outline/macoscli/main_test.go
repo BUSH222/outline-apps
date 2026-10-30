@@ -121,6 +121,14 @@ func runCLIContext(t *testing.T, ctx context.Context, e env, args ...string) res
 	if e.stateDir == "" {
 		e.stateDir = t.TempDir()
 	}
+	// Tests never touch the real /etc/hosts or /etc/pf.conf.
+	if e.hostsPath == "" {
+		e.hostsPath = testHostsFile(t)
+	}
+	if e.pfConfPath == "" {
+		e.pfConfPath = filepath.Join(t.TempDir(), "pf.conf")
+		require.NoError(t, os.WriteFile(e.pfConfPath, []byte("anchor \"com.apple/*\"\n"), 0o644))
+	}
 	if e.geteuid == nil {
 		e.geteuid = func() int { return 501 }
 	}
@@ -156,6 +164,16 @@ func (b *syncBuffer) String() string {
 	return b.buf.String()
 }
 
+// testHostsContent is the hosts file tests start with.
+const testHostsContent = "127.0.0.1\tlocalhost\n::1\tlocalhost\n"
+
+func testHostsFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hosts")
+	require.NoError(t, os.WriteFile(path, []byte(testHostsContent), 0o644))
+	return path
+}
+
 func requireNoSecrets(t *testing.T, r result) {
 	t.Helper()
 	for _, out := range []string{r.stdout, r.stderr} {
@@ -178,14 +196,6 @@ func TestUsage(t *testing.T) {
 	require.Equal(t, exitOK, runCLI(t, env{}, "connect", "-h").code)
 	require.Equal(t, exitUsage, runCLI(t, env{}, "connect", "--dry-run", "extra").code)
 	require.Equal(t, exitUsage, runCLI(t, env{}, "connect", "--log-level", "loud").code)
-}
-
-func TestNotImplementedCommands(t *testing.T) {
-	for _, cmd := range []string{"lockdown", "unlock"} {
-		r := runCLI(t, env{}, cmd)
-		require.Equal(t, exitError, r.code, cmd)
-		require.Contains(t, r.stderr, "not implemented yet")
-	}
 }
 
 func TestConnectWithoutRootChangesNothing(t *testing.T) {

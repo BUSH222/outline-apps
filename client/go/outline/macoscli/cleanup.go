@@ -31,7 +31,8 @@ import (
 )
 
 // runCleanup restores routes, DNS and IPv6 from the state file left by a
-// session that didn't shut down cleanly.
+// session that didn't shut down cleanly. If lockdown is on, it re-installs
+// it in its disconnected form (it never removes it; only unlock does).
 func runCleanup(ctx context.Context, args []string, e env) int {
 	flags := flag.NewFlagSet("cleanup", flag.ContinueOnError)
 	flags.SetOutput(e.stderr)
@@ -57,6 +58,7 @@ func runCleanup(ctx context.Context, args []string, e env) int {
 		return exitError
 	}
 	store := state.FileStore{Dir: e.stateDir}
+	lk := e.lockdownManager(logger)
 
 	if *dryRun {
 		st, err := store.Load()
@@ -65,6 +67,9 @@ func runCleanup(ctx context.Context, args []string, e env) int {
 		}
 		if err != nil {
 			return fail(err)
+		}
+		if locked, err := lk.Status(); err == nil && locked != nil {
+			fmt.Fprintf(e.stdout, "lockdown is on (%s): cleanup would re-install its pf rules and hosts block\n", strings.Join(locked.Entries, ", "))
 		}
 		if st == nil {
 			fmt.Fprintln(e.stdout, "nothing to clean up: no state file")
@@ -91,8 +96,24 @@ func runCleanup(ctx context.Context, args []string, e env) int {
 	defer unlock()
 
 	restored, err := tunnel.Cleanup(ctx, &sysrouter.Router{Exec: e.exec}, store, logger)
+	// The lockdown is re-installed whatever happened above: after a crash
+	// while connected its hosts block is missing, and after a reboot its pf
+	// rules are gone.
+	locked, lockErr := lk.Status()
+	if lockErr == nil && locked != nil {
+		lockErr = lk.Disconnected(ctx)
+		if lockErr == nil {
+			fmt.Fprintf(e.stdout, "lockdown re-installed: %s are blocked while the VPN is off\n", strings.Join(locked.Entries, ", "))
+		}
+	}
+	if lockErr != nil {
+		lockErr = fmt.Errorf("re-installing the lockdown failed: %w", lockErr)
+	}
 	if err != nil {
-		return fail(fmt.Errorf("%w\nThe state file %s still lists what is left; run cleanup again, or see docs/macos-cli/README.md for manual recovery", err, store.Path()))
+		return fail(fmt.Errorf("%w\nThe state file %s still lists what is left; run cleanup again, or see docs/macos-cli/README.md for manual recovery", errors.Join(err, lockErr), store.Path()))
+	}
+	if lockErr != nil {
+		return fail(lockErr)
 	}
 	if restored == nil {
 		fmt.Fprintln(e.stdout, "nothing to clean up: no state file")

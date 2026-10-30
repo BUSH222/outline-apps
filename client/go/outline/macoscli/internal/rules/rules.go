@@ -251,6 +251,20 @@ func normalizeEntry(raw string) (name string, wildcard bool, err error) {
 	return ascii, wildcard, nil
 }
 
+// FromLists builds rules from entries as they would appear in a rules file,
+// with the default TTLs.
+func FromLists(bypass, vpnOnly []string) (*Rules, error) {
+	r := Empty()
+	var err error
+	if r.Bypass, err = r.addList("bypass", bypass, Bypass); err != nil {
+		return nil, err
+	}
+	if r.VPNOnly, err = r.addList("vpn_only", vpnOnly, VPNOnly); err != nil {
+		return nil, err
+	}
+	return r, nil
+}
+
 // Normalize prepares a name from a DNS message for matching: lowercase,
 // without the trailing dot. Names on the wire are already ASCII (punycode).
 func Normalize(name string) string {
@@ -285,6 +299,18 @@ func (r *Rules) matchEntry(name string) (Class, string) {
 		}
 	}
 	return best, rule
+}
+
+// ExactVPNOnly lists the vpn_only entries written without "*.", which can be
+// resolved (through the tunnel) ahead of time.
+func (r *Rules) ExactVPNOnly() []string {
+	var out []string
+	for _, v := range r.VPNOnly {
+		if !strings.HasPrefix(v, "*.") {
+			out = append(out, v)
+		}
+	}
+	return out
 }
 
 // ExactBypass lists the bypass names that can be resolved ahead of time: the

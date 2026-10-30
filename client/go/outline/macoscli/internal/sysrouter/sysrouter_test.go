@@ -257,6 +257,9 @@ func TestIsReadOnly(t *testing.T) {
 		sysexec.Cmd("networksetup", "-listnetworkserviceorder"),
 		sysexec.Cmd("networksetup", "-getdnsservers", "Wi-Fi"),
 		sysexec.Cmd("networksetup", "-getinfo", "Wi-Fi"),
+		sysexec.Cmd("pfctl", "-s", "info"),
+		sysexec.Cmd("pfctl", "-s", "rules"),
+		sysexec.Cmd("pfctl", "-a", "com.apple/outline-cli", "-s", "rules"),
 	}
 	mutating := []sysexec.Call{
 		sysexec.Cmd("route", "-n", "add", "-net", "0.0.0.0/1", "-interface", "utun5"),
@@ -270,7 +273,13 @@ func TestIsReadOnly(t *testing.T) {
 		sysexec.Cmd("ifconfig", "utun5", "inet", "10.111.222.1", "10.111.222.2"),
 		sysexec.Cmd("dscacheutil", "-flushcache"),
 		sysexec.Cmd("killall", "-HUP", "mDNSResponder"),
-		sysexec.Cmd("pfctl", "-s", "rules"),
+		sysexec.Cmd("pfctl", "-E"),
+		sysexec.Cmd("pfctl", "-X", "123"),
+		sysexec.Cmd("pfctl", "-f", "/etc/pf.conf"),
+		sysexec.Cmd("pfctl", "-a", "com.apple/outline-cli", "-f", "/var/db/outline-cli/anchor.conf"),
+		sysexec.Cmd("pfctl", "-a", "com.apple/outline-cli", "-F", "all"),
+		sysexec.Cmd("pfctl", "-a", "com.apple/outline-cli", "-s", "rules", "-F", "all"),
+		sysexec.Cmd("pfctl", "-s", "rules", "-f", "/tmp/x"),
 	}
 	for _, c := range readOnly {
 		require.True(t, IsReadOnly(c), c.String())

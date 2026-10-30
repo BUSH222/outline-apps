@@ -38,6 +38,14 @@ func TestReal_Success(t *testing.T) {
 	require.Equal(t, "out\n", string(out))
 }
 
+func TestReal_CombinedOutput(t *testing.T) {
+	c := Cmd("sh", "-c", "echo out; echo err >&2")
+	c.CombinedOutput = true
+	out, err := Real{}.Run(context.Background(), c)
+	require.NoError(t, err)
+	require.Equal(t, "out\nerr\n", string(out))
+}
+
 func TestReal_Failure(t *testing.T) {
 	_, err := Real{}.Run(context.Background(), Cmd("sh", "-c", "echo out; echo err >&2; exit 3"))
 	var ce *CommandError

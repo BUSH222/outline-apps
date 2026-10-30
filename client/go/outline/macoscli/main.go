@@ -30,6 +30,7 @@ import (
 	"syscall"
 	"time"
 
+	"localhost/client/go/outline/macoscli/internal/lockdown"
 	"localhost/client/go/outline/macoscli/internal/netbind"
 	"localhost/client/go/outline/macoscli/internal/redact"
 	"localhost/client/go/outline/macoscli/internal/state"
@@ -52,8 +53,10 @@ Usage:
   sudo outline-cli connect  --key-file PATH | --key KEY   [--rules PATH] [--log-level LEVEL]
        outline-cli connect  ... --dry-run   resolve the key and print the plan; no root needed
   sudo outline-cli cleanup  [--dry-run]     restore routes, DNS and IPv6 from the state file
-  sudo outline-cli lockdown                 install the VPN-only block rules (persistent)
-  sudo outline-cli unlock                   remove the VPN-only block rules
+  sudo outline-cli lockdown [--rules PATH] [--dry-run]
+                                            block the vpn_only domains while the VPN is off
+                                            (stays until unlock, except across a reboot)
+  sudo outline-cli unlock                   remove that block
        outline-cli version
 
 A key is an ss://, ssconf:// or https:// access key, or a path to a tunnel config
@@ -92,6 +95,15 @@ type env struct {
 	watchInterval time.Duration
 	// verify builds the check that runs once traffic is routed into the tunnel.
 	verify verifyFunc
+	// hostsPath and pfConfPath are the system files lockdown uses. Tests
+	// always point them at temporary files.
+	hostsPath  string
+	pfConfPath string
+}
+
+// lockdownManager returns the lockdown manager for this environment.
+func (e env) lockdownManager(log *slog.Logger) *lockdown.Manager {
+	return &lockdown.Manager{Exec: e.exec, Dir: e.stateDir, HostsPath: e.hostsPath, PFConfPath: e.pfConfPath, Log: log}
 }
 
 func main() {
@@ -113,6 +125,8 @@ func main() {
 		openTUN:        tunnel.OpenUTun,
 		startTransport: startRemoteDevice,
 		verify:         verifyTunnel,
+		hostsPath:      lockdown.DefaultHostsPath,
+		pfConfPath:     lockdown.DefaultPFConfPath,
 	}))
 }
 
@@ -128,9 +142,9 @@ func run(ctx context.Context, args []string, e env) int {
 	case "cleanup":
 		return runCleanup(ctx, rest, e)
 	case "lockdown":
-		return notImplemented(e, "lockdown", "M5")
+		return runLockdown(ctx, rest, e)
 	case "unlock":
-		return notImplemented(e, "unlock", "M5")
+		return runUnlock(ctx, rest, e)
 	case "version", "-version", "--version":
 		fmt.Fprintln(e.stdout, version)
 		return exitOK
@@ -141,11 +155,6 @@ func run(ctx context.Context, args []string, e env) int {
 		fmt.Fprintf(e.stderr, "outline-cli: unknown command %q\n\n%s", cmd, usage)
 		return exitUsage
 	}
-}
-
-func notImplemented(e env, cmd, milestone string) int {
-	fmt.Fprintf(e.stderr, "outline-cli: %s is not implemented yet (milestone %s)\n", cmd, milestone)
-	return exitError
 }
 
 // newLogger returns a text logger on w that redacts secrets, and makes it the

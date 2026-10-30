@@ -50,6 +50,7 @@ type Snapshot struct {
 	Routes []string // sorted RouteSpec strings
 	DNS    map[string]string
 	IPv6   map[string]sysrouter.IPv6Config
+	PF     string // pf's state, summarized
 }
 
 // Crash is panicked by the executor to simulate the process dying.
@@ -70,6 +71,7 @@ type Mac struct {
 	dns      map[string][]string // manual DNS; nil = DHCP
 	ipv6     map[string]sysrouter.IPv6Config
 	utuns    map[string]string
+	pf       pf
 	flushes  int
 	mutation int
 
@@ -111,6 +113,7 @@ func New() *Mac {
 			Ethernet.Service.Name: {Mode: sysrouter.IPv6Automatic, Raw: "Automatic"},
 		},
 		utuns: map[string]string{},
+		pf:    newPF(),
 	}
 	link := netip.MustParsePrefix("169.254.0.0/16")
 	m.routes[link] = sysrouter.RouteSpec{Dst: link, Interface: "en0"}
@@ -248,6 +251,7 @@ func (m *Mac) Snapshot() Snapshot {
 		}
 		s.IPv6[svc.Name] = m.ipv6[svc.Name]
 	}
+	s.PF = m.pfSummary()
 	return s
 }
 
@@ -313,6 +317,8 @@ func (m *Mac) dispatch(c sysexec.Call) (string, string) {
 		return "", ""
 	case "ipconfig":
 		return m.ipconfig(a)
+	case "pfctl":
+		return m.pfctl(a)
 	case "dscacheutil", "killall":
 		m.flushes++
 		return "", ""

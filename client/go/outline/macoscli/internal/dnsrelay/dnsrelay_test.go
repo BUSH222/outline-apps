@@ -543,8 +543,8 @@ func TestPrefetch_RefreshesAt80PercentOfTheTTL(t *testing.T) {
 
 func TestPrefetch_RetriesFailures(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
-		direct := &fakeExchanger{answer: func(q []byte, _ bool) ([]byte, error) {
-			return dnstest.ReplyTo(q, dnstest.Options{RCode: dnsmessage.RCodeNameError}), nil
+		direct := &fakeExchanger{answer: func([]byte, bool) ([]byte, error) {
+			return nil, errors.New("no answer")
 		}}
 		r := testRelay(t, direct)
 		ctx, cancel := context.WithCancel(context.Background())
@@ -557,6 +557,93 @@ func TestPrefetch_RetriesFailures(t *testing.T) {
 		cancel()
 		synctest.Wait()
 	})
+}
+
+func TestPrefetch_AnswerWithoutAddressesWaitsForMaxTTL(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		direct := &fakeExchanger{answer: func(q []byte, _ bool) ([]byte, error) {
+			return dnstest.ReplyTo(q, dnstest.Options{RCode: dnsmessage.RCodeNameError}), nil
+		}}
+		r := testRelay(t, direct)
+		ctx, cancel := context.WithCancel(context.Background())
+		go r.Prefetch(ctx, []string{"lichess.org"})
+		synctest.Wait()
+		require.Equal(t, int32(1), direct.calls.Load())
+		time.Sleep(time.Hour - time.Second) // max_ttl is 1h
+		synctest.Wait()
+		require.Equal(t, int32(1), direct.calls.Load())
+		time.Sleep(time.Second)
+		synctest.Wait()
+		require.Equal(t, int32(2), direct.calls.Load())
+		cancel()
+		synctest.Wait()
+	})
+}
+
+func TestPrefetchVia_TheTunnelForVPNOnlyNames(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var mu sync.Mutex
+		var asked []string
+		tun := &StreamExchanger{Dial: func(context.Context) (transport.StreamConn, error) {
+			client, server := net.Pipe()
+			go func() {
+				defer server.Close()
+				var f Framer
+				buf := make([]byte, 512)
+				for {
+					n, err := server.Read(buf)
+					msgs, _ := f.Push(buf[:n])
+					for _, q := range msgs {
+						var p dnsmessage.Parser
+						p.Start(q)
+						question, _ := p.Question()
+						mu.Lock()
+						asked = append(asked, question.Type.String())
+						mu.Unlock()
+						addr := "192.0.2.50"
+						if question.Type == dnsmessage.TypeAAAA {
+							addr = "2001:db8::50"
+						}
+						server.Write(dnstest.Frame(dnstest.ReplyTo(q, dnstest.Options{}, dnstest.RR{Name: "secret.example", Addr: addr, TTL: 600})))
+						return
+					}
+					if err != nil {
+						return
+					}
+				}
+			}()
+			return pipeConn{client}, nil
+		}}
+		r := testRelay(t, &fakeExchanger{answer: func([]byte, bool) ([]byte, error) {
+			t.Error("vpn_only names must never be resolved directly")
+			return nil, errors.New("no")
+		}})
+		var learned []netip.Addr
+		r.OnLearn = func(addrs []netip.Addr) {
+			mu.Lock()
+			defer mu.Unlock()
+			learned = append(learned, addrs...)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go r.PrefetchVia(ctx, []string{"secret.example"}, tun, dnsmessage.TypeA, dnsmessage.TypeAAAA)
+		synctest.Wait()
+		require.ElementsMatch(t, []string{"TypeA", "TypeAAAA"}, asked)
+		require.Equal(t, rules.VPNOnly, lookup(r, "192.0.2.50"))
+		require.Equal(t, rules.VPNOnly, lookup(r, "2001:db8::50"))
+		require.Len(t, learned, 2)
+		cancel()
+		synctest.Wait()
+	})
+}
+
+func TestStreamExchanger_Timeout(t *testing.T) {
+	ex := &StreamExchanger{Timeout: 20 * time.Millisecond, Dial: func(context.Context) (transport.StreamConn, error) {
+		client, server := net.Pipe()
+		go io.Copy(io.Discard, server) // never answers
+		return pipeConn{client}, nil
+	}}
+	_, err := ex.Exchange(context.Background(), dnstest.Query(1, dnsmessage.TypeA, "secret.example"), true)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
 }
 
 func TestOnLearnRunsBeforeTheAnswerIsPassedOn(t *testing.T) {

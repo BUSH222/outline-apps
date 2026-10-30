@@ -312,3 +312,12 @@ func TestSyncDirectRoutes(t *testing.T) {
 	syncDirectRoutes(r, cache, []netip.Addr{bypass}, log)
 	require.Contains(t, logs.String(), "updating the direct route of an address failed")
 }
+
+func TestVPNOnlyAddrs(t *testing.T) {
+	cache := ipcache.New(time.Minute, time.Hour, nil)
+	vpnOnly, bypass := netip.MustParseAddr("192.0.2.2"), netip.MustParseAddr("192.0.2.1")
+	cache.Learn(vpnOnly, rules.VPNOnly, "secret.example", time.Hour)
+	cache.Learn(bypass, rules.Bypass, "lichess.org", time.Hour)
+	require.Equal(t, map[netip.Addr]string{vpnOnly: "secret.example"}, vpnOnlyAddrs(cache, []netip.Addr{vpnOnly, bypass}))
+	require.Nil(t, vpnOnlyAddrs(cache, []netip.Addr{bypass}))
+}
