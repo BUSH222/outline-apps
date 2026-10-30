@@ -19,49 +19,29 @@ import (
 	"fmt"
 	"io/fs"
 	"os"
-	"os/user"
 	"path/filepath"
 
 	"localhost/client/go/outline/macoscli/internal/rules"
 )
 
-// defaultRulesRelPath is the rules file location inside a home directory.
-var defaultRulesRelPath = filepath.Join(".config", "outline-cli", "rules.yaml")
-
 // rulesLocation is where the rules file is expected.
 type rulesLocation struct {
 	Path string
 	// Explicit is true when the path came from --rules. A missing explicit
-	// file is an error; a missing default file means "no rules".
+	// file is an error; a missing default file means "no rules" (and connect
+	// creates it).
 	Explicit bool
 	// Origin explains how the path was chosen, for display.
 	Origin string
 }
 
-// resolveRulesPath finds the rules file:
-//  1. --rules, if given;
-//  2. under sudo, the invoking user's home (from SUDO_USER via the user
-//     database, because $HOME may be root's);
-//  3. otherwise $HOME.
-func resolveRulesPath(flagValue string, getenv func(string) string, lookupUser func(string) (*user.User, error)) (rulesLocation, error) {
+// resolveRulesPath finds the rules file: --rules if given, otherwise
+// rules.yaml in dir (the executable's directory).
+func resolveRulesPath(flagValue, dir string) rulesLocation {
 	if flagValue != "" {
-		return rulesLocation{Path: flagValue, Explicit: true, Origin: "--rules"}, nil
+		return rulesLocation{Path: flagValue, Explicit: true, Origin: "--rules"}
 	}
-	if sudoUser := getenv("SUDO_USER"); sudoUser != "" {
-		u, err := lookupUser(sudoUser)
-		if err != nil || u.HomeDir == "" {
-			return rulesLocation{}, fmt.Errorf("can't find the home directory of SUDO_USER %q (%v); pass --rules PATH", sudoUser, err)
-		}
-		return rulesLocation{
-			Path:   filepath.Join(u.HomeDir, defaultRulesRelPath),
-			Origin: "home of SUDO_USER " + sudoUser,
-		}, nil
-	}
-	home := getenv("HOME")
-	if home == "" {
-		return rulesLocation{}, fmt.Errorf("HOME is not set; pass --rules PATH")
-	}
-	return rulesLocation{Path: filepath.Join(home, defaultRulesRelPath), Origin: "$HOME"}, nil
+	return rulesLocation{Path: filepath.Join(dir, defaultRulesName), Origin: "next to the program"}
 }
 
 // loadRules reads the rules file. A missing default file means no rules; a
@@ -71,7 +51,7 @@ func loadRules(loc rulesLocation) (*rules.Rules, string, error) {
 	info, err := os.Stat(loc.Path)
 	switch {
 	case errors.Is(err, fs.ErrNotExist) && !loc.Explicit:
-		return rules.Empty(), "not found: running without rules", nil
+		return rules.Empty(), "not found: running without rules; connect creates an empty one", nil
 	case err != nil:
 		return nil, "", fmt.Errorf("rules file: %w", err)
 	case !info.Mode().IsRegular():

@@ -23,6 +23,8 @@ import (
 	"io/fs"
 	"log/slog"
 	"net/netip"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -51,8 +53,8 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	flags := flag.NewFlagSet("connect", flag.ContinueOnError)
 	flags.SetOutput(e.stderr)
 	flags.StringVar(&f.key, "key", "", "access key (ss://, ssconf://, https://) or config file path; lands in shell history, prefer --key-file")
-	flags.StringVar(&f.keyFile, "key-file", "", "file holding the access key (recommended; mode 0600)")
-	flags.StringVar(&f.rules, "rules", "", "rules file (default: ~/.config/outline-cli/rules.yaml of the invoking user)")
+	flags.StringVar(&f.keyFile, "key-file", "", "file holding the access key (default: "+defaultKeyName+" next to the program)")
+	flags.StringVar(&f.rules, "rules", "", "rules file (default: "+defaultRulesName+" next to the program)")
 	flags.StringVar(&f.logLevel, "log-level", "info", "log level: debug, info, warn or error")
 	flags.BoolVar(&f.dryRun, "dry-run", false, "resolve the key and print the plan; change nothing (no root needed)")
 	if err := flags.Parse(args); err != nil {
@@ -87,6 +89,28 @@ func runConnect(ctx context.Context, args []string, e env) int {
 		defer unlock()
 	}
 
+	// Without a key or rules given, both files sit next to the program. A
+	// real connect creates them if they are missing.
+	dir, err := exeDir(e)
+	if err != nil {
+		return fail(err)
+	}
+	defaultKey := f.key == "" && f.keyFile == "" && strings.TrimSpace(e.getenv(keys.EnvKey)) == ""
+	if defaultKey {
+		f.keyFile = filepath.Join(dir, defaultKeyName)
+	}
+	rulesLoc := resolveRulesPath(f.rules, dir)
+	if !f.dryRun {
+		if err := createDefaultFiles(e, defaultKey, f.keyFile, rulesLoc); err != nil {
+			return fail(err)
+		}
+	}
+	if defaultKey {
+		if err := checkDefaultKeyFile(f.keyFile); err != nil {
+			return fail(err)
+		}
+	}
+
 	raw, err := keys.Read(keys.Input{Key: f.key, KeyFile: f.keyFile, Getenv: e.getenv})
 	if err != nil {
 		return fail(err)
@@ -119,10 +143,6 @@ func runConnect(ctx context.Context, args []string, e env) int {
 	}
 	if parsed.HasReporter {
 		logger.Warn("this key includes a usage reporter, which outline-cli does not run")
-	}
-	rulesLoc, err := resolveRulesPath(f.rules, e.getenv, e.lookupUser)
-	if err != nil {
-		return fail(err)
 	}
 	domainRules, rulesStatus, err := loadRules(rulesLoc)
 	if err != nil {
@@ -247,6 +267,47 @@ func orNone(s string) string {
 		return "none"
 	}
 	return s
+}
+
+// createDefaultFiles creates the default key file (empty, mode 0600) and
+// rules file (comments only) if they are missing, owned by the user who ran
+// sudo, and says so.
+func createDefaultFiles(e env, defaultKey bool, keyFile string, rulesLoc rulesLocation) error {
+	if defaultKey {
+		created, err := ensureFile(e, keyFile, nil, 0o600)
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Fprintf(e.stdout, "created %s: paste your access key into it\n", keyFile)
+		}
+	}
+	if !rulesLoc.Explicit {
+		created, err := ensureFile(e, rulesLoc.Path, []byte(rulesTemplate), 0o644)
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Fprintf(e.stdout, "created %s: domain rules (none yet)\n", rulesLoc.Path)
+		}
+	}
+	return nil
+}
+
+// checkDefaultKeyFile explains what to do when the default key file is
+// missing (a dry run doesn't create it) or still empty.
+func checkDefaultKeyFile(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("no access key: put it in %s (connect creates the file), or pass --key-file PATH", path)
+	}
+	if err != nil {
+		return fmt.Errorf("reading the key file: %w", err)
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return fmt.Errorf("no access key yet: paste your Outline access key into %s, save it, and start outline-cli again", path)
+	}
+	return nil
 }
 
 // checkVPNOnlyTransport refuses vpn_only rules with a transport that sends

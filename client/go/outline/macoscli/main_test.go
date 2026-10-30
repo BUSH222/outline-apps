@@ -25,7 +25,6 @@ import (
 	"net/http/httptest"
 	"net/netip"
 	"os"
-	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -111,8 +110,14 @@ func runCLIContext(t *testing.T, ctx context.Context, e env, args ...string) res
 			return ""
 		}
 	}
-	if e.lookupUser == nil {
-		e.lookupUser = func(string) (*user.User, error) { return nil, errors.New("no user database in tests") }
+	if e.executable == nil {
+		// The default key and rules files go next to a program in a temporary directory.
+		exe := filepath.Join(t.TempDir(), "outline-cli")
+		e.executable = func() (string, error) { return exe, nil }
+	}
+	if e.elevate == nil {
+		// Tests never run the real sudo.
+		e.elevate = func([]string) error { return errors.New("test: no sudo") }
 	}
 	// Tests never run real system commands.
 	if e.exec == nil {
@@ -188,7 +193,6 @@ func TestVersion(t *testing.T) {
 }
 
 func TestUsage(t *testing.T) {
-	require.Equal(t, exitUsage, runCLI(t, env{}).code)
 	r := runCLI(t, env{}, "bogus")
 	require.Equal(t, exitUsage, r.code)
 	require.Contains(t, r.stderr, `unknown command "bogus"`)
@@ -317,31 +321,8 @@ min_ttl: 30s
 }
 
 func TestResolveRulesPath(t *testing.T) {
-	envOf := func(m map[string]string) func(string) string { return func(k string) string { return m[k] } }
-	lookup := func(name string) (*user.User, error) {
-		if name == "alice" {
-			return &user.User{Username: "alice", HomeDir: "/Users/alice"}, nil
-		}
-		return nil, user.UnknownUserError(name)
-	}
-
-	loc, err := resolveRulesPath("/etc/rules.yaml", envOf(map[string]string{"SUDO_USER": "alice"}), lookup)
-	require.NoError(t, err)
-	require.Equal(t, rulesLocation{Path: "/etc/rules.yaml", Explicit: true, Origin: "--rules"}, loc)
-
-	// Under sudo, the invoking user's home wins over root's $HOME.
-	loc, err = resolveRulesPath("", envOf(map[string]string{"SUDO_USER": "alice", "HOME": "/var/root"}), lookup)
-	require.NoError(t, err)
-	require.Equal(t, "/Users/alice/.config/outline-cli/rules.yaml", loc.Path)
-	require.False(t, loc.Explicit)
-
-	_, err = resolveRulesPath("", envOf(map[string]string{"SUDO_USER": "mallory"}), lookup)
-	require.ErrorContains(t, err, "pass --rules")
-
-	loc, err = resolveRulesPath("", envOf(map[string]string{"HOME": "/Users/bob"}), lookup)
-	require.NoError(t, err)
-	require.Equal(t, "/Users/bob/.config/outline-cli/rules.yaml", loc.Path)
-
-	_, err = resolveRulesPath("", envOf(nil), lookup)
-	require.ErrorContains(t, err, "HOME is not set")
+	require.Equal(t, rulesLocation{Path: "/etc/rules.yaml", Explicit: true, Origin: "--rules"},
+		resolveRulesPath("/etc/rules.yaml", "/Applications/outline"))
+	require.Equal(t, rulesLocation{Path: "/Applications/outline/rules.yaml", Origin: "next to the program"},
+		resolveRulesPath("", "/Applications/outline"))
 }

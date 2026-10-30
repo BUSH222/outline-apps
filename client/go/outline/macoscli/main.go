@@ -25,7 +25,6 @@ import (
 	"net/netip"
 	"os"
 	"os/signal"
-	"os/user"
 	"strings"
 	"syscall"
 	"time"
@@ -50,7 +49,9 @@ const (
 const usage = `outline-cli: an Outline VPN client for macOS without a Network Extension.
 
 Usage:
-  sudo outline-cli connect  --key-file PATH | --key KEY   [--rules PATH] [--log-level LEVEL]
+       outline-cli                          (or double-click it) connect with access-key.txt and
+                                            rules.yaml next to the program; asks for your password
+  sudo outline-cli connect  [--key-file PATH | --key KEY] [--rules PATH] [--log-level LEVEL]
        outline-cli connect  ... --dry-run   resolve the key and print the plan; no root needed
   sudo outline-cli cleanup  [--dry-run]     restore routes, DNS and IPv6 from the state file
   sudo outline-cli lockdown [--rules PATH] [--dry-run]
@@ -60,9 +61,10 @@ Usage:
        outline-cli version
 
 A key is an ss://, ssconf:// or https:// access key, or a path to a tunnel config
-file. It can also come from the OUTLINE_KEY environment variable. sudo drops
-most environment variables, so prefer --key-file (mode 0600), or run
-"sudo env OUTLINE_KEY=... outline-cli connect".
+file. By default it is read from access-key.txt next to the program, and the
+rules from rules.yaml there; connect creates both if they are missing. It can
+also come from --key-file, --key, or the OUTLINE_KEY environment variable (sudo
+drops it unless you run "sudo env OUTLINE_KEY=... outline-cli connect").
 
 Run "outline-cli COMMAND -h" for a command's flags.
 `
@@ -70,11 +72,14 @@ Run "outline-cli COMMAND -h" for a command's flags.
 // env holds the process environment, so tests can replace it. Tests always
 // use a simulated system executor, never the real one.
 type env struct {
-	stdout     io.Writer
-	stderr     io.Writer
-	getenv     func(string) string
-	lookupUser func(string) (*user.User, error)
-	geteuid    func() int
+	stdout io.Writer
+	stderr io.Writer
+	getenv func(string) string
+	// executable returns the program's path; the default files sit next to it.
+	executable func() (string, error)
+	// elevate replaces the process with "sudo argv..." (for a double-click).
+	elevate func(argv []string) error
+	geteuid func() int
 	// httpTransport is used to fetch dynamic keys; nil means the default.
 	httpTransport http.RoundTripper
 	// exec runs system commands (route, networksetup, ...).
@@ -114,7 +119,8 @@ func main() {
 		stdout:     os.Stdout,
 		stderr:     os.Stderr,
 		getenv:     os.Getenv,
-		lookupUser: user.Lookup,
+		executable: os.Executable,
+		elevate:    execSudo,
 		geteuid:    os.Geteuid,
 		exec:       sysexec.Real{},
 		stateDir:   state.DefaultDir,
@@ -132,8 +138,7 @@ func main() {
 
 func run(ctx context.Context, args []string, e env) int {
 	if len(args) == 0 {
-		fmt.Fprint(e.stderr, usage)
-		return exitUsage
+		return runDefault(ctx, e)
 	}
 	cmd, rest := args[0], args[1:]
 	switch cmd {
@@ -155,6 +160,32 @@ func run(ctx context.Context, args []string, e env) int {
 		fmt.Fprintf(e.stderr, "outline-cli: unknown command %q\n\n%s", cmd, usage)
 		return exitUsage
 	}
+}
+
+// runDefault is what a double-click runs: connect with the files next to the
+// program. Finder starts it as the user in a Terminal window, so it first
+// restarts itself through sudo, which asks for the password there. Ctrl-C
+// (or closing the window) disconnects.
+func runDefault(ctx context.Context, e env) int {
+	if e.geteuid() == 0 {
+		return runConnect(ctx, nil, e)
+	}
+	exe, err := e.executable()
+	if err != nil {
+		fmt.Fprintf(e.stderr, "outline-cli: finding the program's own location: %v\n", err)
+		return exitError
+	}
+	fmt.Fprintln(e.stdout, "outline-cli needs administrator rights to change network settings; enter your Mac password if asked.")
+	err = e.elevate([]string{exe, "connect"})
+	// Only reached if sudo couldn't be started.
+	fmt.Fprintf(e.stderr, "outline-cli: starting sudo: %v\nRun it yourself: sudo %s connect\n", err, exe)
+	return exitError
+}
+
+// execSudo replaces the process with sudo running argv.
+func execSudo(argv []string) error {
+	const sudo = "/usr/bin/sudo"
+	return syscall.Exec(sudo, append([]string{"sudo", "-p", "Password for %u: "}, argv...), os.Environ())
 }
 
 // newLogger returns a text logger on w that redacts secrets, and makes it the

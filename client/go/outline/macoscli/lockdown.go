@@ -33,7 +33,7 @@ import (
 func runLockdown(ctx context.Context, args []string, e env) int {
 	flags := flag.NewFlagSet("lockdown", flag.ContinueOnError)
 	flags.SetOutput(e.stderr)
-	rulesFlag := flags.String("rules", "", "rules file (default: ~/.config/outline-cli/rules.yaml of the invoking user)")
+	rulesFlag := flags.String("rules", "", "rules file (default: "+defaultRulesName+" next to the program)")
 	logLevel := flags.String("log-level", "info", "log level: debug, info, warn or error")
 	dryRun := flags.Bool("dry-run", false, "print what would be installed; change nothing")
 	if code, ok := parseFlags(flags, args, e, "lockdown"); !ok {
@@ -49,10 +49,11 @@ func runLockdown(ctx context.Context, args []string, e env) int {
 		return exitError
 	}
 
-	loc, err := resolveRulesPath(*rulesFlag, e.getenv, e.lookupUser)
+	dir, err := exeDir(e)
 	if err != nil {
 		return fail(err)
 	}
+	loc := resolveRulesPath(*rulesFlag, dir)
 	r, _, err := loadRules(loc)
 	if err != nil {
 		return fail(err)
