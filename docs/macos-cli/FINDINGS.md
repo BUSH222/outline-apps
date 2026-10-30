@@ -328,3 +328,15 @@ Approved by the developer: when the binder can't look up a first-hop host name (
 Also seen: `ifconfig.me` now has an IPv6 address (the AAAA lookup through the tunnel found one), unlike in manual test 3 (section 11). The IPv6 leak check in `MANUAL_TEST.md` uses `ipv6.icanhazip.com` anyway.
 
 Also seen: after the crash, `netstat` showed `169.254.113.53 link#7 UHRLSW en1 !`. That is macOS's own entry, cloned from the on-link `169.254/16` route when something kept querying the old DNS address; it isn't the CLI's and expires by itself.
+
+## 21. Manual test 10 (developer's Mac, 2026-10-30): crash cleanup fixed
+
+With commit `e825d82c`, `cleanup` after `kill -9` restores everything, the lockdown included, and so does a plain `connect` after a crash (it runs the same recovery first).
+
+Between the crash and the recovery, nothing that needs DNS works (DNS still points at the dead tunnel's address; plain `curl` to a host name hung, and one later attempt went through once a cached answer was used). The developer accepted this as intended; it's documented in `README.md` and `MANUAL_TEST.md` section 5.
+
+## 22. M6 notes
+
+- `docs/macos-cli/README.md`: recovery first, then install (CI artifact with `chmod +x`, `xattr -dr com.apple.quarantine` and the SHA-256 check; or `build-local.sh`), the key file, connect, rules, lockdown, limits, what the CLI changes on the Mac, and pointers for developers.
+- `MANUAL_TEST.md`: scope finalized; the lockdown checks fill in the learned address with a command, because the developer twice hit zsh reading a leftover `<address>` placeholder as a redirect.
+- CI already builds, signs and uploads the universal artifact `outline-cli-macos-universal`; the developer has been testing with downloads of it.

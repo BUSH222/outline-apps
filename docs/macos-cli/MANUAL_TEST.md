@@ -2,7 +2,9 @@
 
 This is the only end-to-end check of the VPN. Unit tests and CI cover the logic and the build, but they never touch a real network. Run the steps in order and note the result of each one.
 
-Scope (M5): connect, disconnect, crash recovery, network changes, the bypass list (section 7) and the VPN-only list with lockdown (section 8).
+It covers connect, disconnect, crash recovery, network changes, the bypass list (section 7) and the VPN-only list with lockdown (section 8). For installing and everyday use, see [`README.md`](README.md).
+
+Commands with `<...>` need that part filled in by hand first; in zsh a leftover `<` is read as a file redirect.
 
 ## 0. If your network breaks: recovery
 
@@ -120,7 +122,7 @@ curl -4 -s https://ifconfig.me; echo        # your normal IP again
 ## 5. Crash recovery (kill -9)
 
 1. Connect as in step 3.
-2. In the second terminal: `sudo pkill -9 -f 'outline-cli connect'`.
+2. In the second terminal: `sudo pkill -9 -f 'outline-cli connect'`. From now until step 4, nothing that needs DNS works: DNS still points at the dead tunnel's address. That's expected.
 3. **N3:** check what the kernel removed:
    ```sh
    netstat -rn -f inet | grep -E 'utun|^0/1|^128.0/1|169.254.113.53'   # expected: nothing (they died with the utun)
@@ -203,14 +205,17 @@ Domains under `vpn_only:` only ever go through the VPN. After `sudo outline-cli 
    sudo ./outline-cli lockdown --dry-run     # shows the hosts lines and the pf rules, with the learned address(es)
    sudo ./outline-cli lockdown
    ```
-   Expected: `lockdown is on: while the VPN is off, ifconfig.me are blocked (N learned address(es) in pf, ...)`, with N at least 1.
+   Expected: `lockdown is on: while the VPN is off, ifconfig.me are blocked (N learned address(es) in pf, ...)`, with N at least 1. Keep one learned IPv4 address for the checks below:
+   ```sh
+   ADDR=$(sudo pfctl -a com.apple/outline-cli -t outline_vpn_only -T show 2>/dev/null | grep -m1 -E '^ *[0-9]+\.' | tr -d ' '); echo "$ADDR"
+   ```
 4. **While disconnected:**
 
 | Check | Command | Expected |
 |---|---|---|
 | The site is blocked | `curl -4 -s -m 5 https://ifconfig.me; echo " exit=$?"` | Fails (non-zero exit) |
 | By name (hosts) | `dscacheutil -q host -a name ifconfig.me` | `ip_address: 0.0.0.0` |
-| By address (pf), even with the name resolved by hand | `curl -4 -s -m 5 --resolve ifconfig.me:443:<address from the dry run> https://ifconfig.me; echo " exit=$?"` | Fails (non-zero exit) |
+| By address (pf), even with the name resolved by hand | `curl -4 -s -m 5 --resolve ifconfig.me:443:$ADDR https://ifconfig.me; echo " exit=$?"` | Fails (non-zero exit, usually 28) |
 | **N4:** the anchor is loaded | `sudo pfctl -a com.apple/outline-cli -s rules` | `block drop out quick from any to <outline_vpn_only>` |
 | The table holds the address | `sudo pfctl -a com.apple/outline-cli -t outline_vpn_only -T show` | The address(es) from the dry run |
 | pf evaluates the anchor | `sudo pfctl -s rules 2>/dev/null \| grep com.apple` | `anchor "com.apple/*" all` |
@@ -221,7 +226,7 @@ Domains under `vpn_only:` only ever go through the VPN. After `sudo outline-cli 
    - `grep -c outline-cli /etc/hosts` prints `0` (the hosts block is out while connected);
    - `sudo pfctl -a com.apple/outline-cli -s rules` shows `pass out quick on utunN ...` before the block.
 6. **Crash while connected:** `sudo pkill -9 -f 'outline-cli connect'`. Then:
-   - `curl -4 -s -m 5 --resolve ifconfig.me:443:<address> https://ifconfig.me; echo " exit=$?"` still fails: the pass rule names a utun that no longer exists.
+   - `curl -4 -s -m 5 --resolve ifconfig.me:443:$ADDR https://ifconfig.me; echo " exit=$?"` still fails: the pass rule names a utun that no longer exists. (Everything else fails too until `cleanup`, because DNS still points at the dead tunnel; see section 5.)
    - `sudo ./outline-cli cleanup` prints `lockdown re-installed: ifconfig.me are blocked while the VPN is off`, and `grep -c outline-cli /etc/hosts` is back to `2` (the two marker lines).
 7. **Unlock:** `sudo ./outline-cli unlock`. Expected: `lockdown is off ...`; `curl -4 -s https://ifconfig.me` prints your normal IP; `grep -c outline-cli /etc/hosts` prints `0`; `sudo pfctl -a com.apple/outline-cli -s rules` prints nothing.
 8. Optional, reboot: lock down, reboot, and repeat the checks of step 4. Expected: the name check still blocks (the hosts file survives), but **the address check passes**: a reboot clears pf. `sudo ./outline-cli cleanup` puts the pf rules back.

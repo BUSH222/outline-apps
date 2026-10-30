@@ -1,9 +1,10 @@
-# macOS CLI: checkpoint (2026-10-30, end of M5)
+# macOS CLI: checkpoint (2026-10-30, M0–M6 done)
 
 Read this first if you are picking up this work. It says where things stand, which rules apply, what was learned the hard way, and what comes next. Details live in:
 
 - [`SPEC.md`](SPEC.md): goals and design. It has been corrected against the code; where the spec and the code disagree, the code wins, and you propose a spec fix.
 - [`FINDINGS.md`](FINDINGS.md): evidence for every assumption, plus a numbered log of each manual test and what it changed.
+- [`README.md`](README.md): install and everyday use, starting with recovery.
 - [`MANUAL_TEST.md`](MANUAL_TEST.md): what the developer runs on the real Mac. It starts with recovery steps.
 - The approved plan, outside the repo: `~/.claude/plans/pasted-content-id-7507-you-are-curried-trinket.md`. It has the original milestone plan and the developer's answers to decisions D1–D8.
 
@@ -71,8 +72,8 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 | M2 Tunnel manager, state file, cleanup, crash safety | Done |
 | M3 Interface binding, real `connect` | **Done and confirmed on the real Mac** (manual tests 1–6: connect, both post-routing checks, disconnect, crash recovery, IPv6 leak check, a 2.4/5 GHz network switch, and a quick phone-hotspot switch) |
 | M4 Bypass list | **Done and confirmed on the real Mac** (manual test 7 found that bypass needs host routes; manual test 8 passed with them) |
-| M5 VPN-only list | **Done and confirmed on the real Mac** (manual test 9; it also found a crash-cleanup bug, now fixed, whose fix still needs one re-run of `MANUAL_TEST.md` section 5) |
-| M6 Universal artifact, README, final `MANUAL_TEST.md` | Partly done (CI already produces the signed universal artifact; README not written) |
+| M5 VPN-only list | **Done and confirmed on the real Mac** (manual test 9; the crash-cleanup bug it found is fixed and confirmed by manual test 10) |
+| M6 Universal artifact, README, final `MANUAL_TEST.md` | **Done** (CI artifact in use by the developer; `README.md` written; `MANUAL_TEST.md` finalized) |
 
 ## 5. How the code fits together
 
@@ -167,14 +168,12 @@ Done (details in `FINDINGS.md` section 19):
 - Part B: `lockdown [--rules] [--dry-run]` and `unlock` (`lockdown.go`); `connect` switches an active lockdown to the connected form and back; `cleanup` and crash recovery re-install it; only `unlock` removes it.
 - Tests: golden anchor and hosts text; exact `pfctl` sequences for lock, connect, learn, disconnect, unlock, reboot plus cleanup, and a foreign main ruleset; CLI tests for every command, using temporary hosts files only.
 
-- **Manual test 9 passed** (FINDINGS 20), including N4. It found that `cleanup` after `kill -9` failed on `route: bad address: utunN` (the utun is gone, so `route` can't resolve it); fixed in `sysrouter.DeleteRoute`, and the simulated Mac now behaves the same way. Waiting for one re-run of the crash test (`MANUAL_TEST.md` section 5) with the fix.
+- **Manual test 9 passed** (FINDINGS 20), including N4. It found that `cleanup` after `kill -9` failed on `route: bad address: utunN` (the utun is gone, so `route` can't resolve it); fixed in `sysrouter.DeleteRoute`, and the simulated Mac now behaves the same way. Confirmed by manual test 10.
 
-## 8b. After M5
+## 8b. After M6
 
-- **M6:**
-  - `docs/macos-cli/README.md`: install (`chmod +x`, `xattr -dr com.apple.quarantine` for the CI download; not needed for local builds), the sudo key/rules guidance, recovery (including the lockdown), and limits.
-  - Finish `MANUAL_TEST.md`.
-- **Known gaps to mention or fix:**
+All milestones are done. What's left is optional; ask the developer before starting any of it.
+- **Known gaps** (all in `README.md` "Limits"):
   - On 2026-10-30 a dry run on the developer's Mac saw `utun4` as the primary default route (some other VPN, or the CLI itself, was up). `connect` doesn't refuse to start while another tunnel owns the default route; it would bind to that utun. Ask, then consider refusing a utun as the physical interface.
   - A dead transport isn't detected while connected (traffic stops until Ctrl-C).
   - Only the primary service's DNS/IPv6 are changed (the CLI warns when several interfaces are active).
