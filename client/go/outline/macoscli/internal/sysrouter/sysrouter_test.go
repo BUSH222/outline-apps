@@ -564,3 +564,35 @@ func TestRouter_InterfaceAddrs(t *testing.T) {
 	require.False(t, IsReadOnly(sysexec.Cmd("ifconfig", "-a")))
 	require.Nil(t, parseInetAddrs("en1: flags=8863<UP>\n\tstatus: inactive\n"))
 }
+
+func TestDeleteRoute_OnADestroyedInterface(t *testing.T) {
+	ctx := context.Background()
+	spec := RouteSpec{Dst: netip.MustParsePrefix("0.0.0.0/1"), Interface: "utun4"}
+	badAddress := func(c sysexec.Call) ([]byte, error) {
+		return nil, &sysexec.CommandError{Call: c, ExitCode: 68, Output: "route: bad address: utun4\n", Err: errors.New("exit status 68")}
+	}
+
+	// The utun died with its process: its routes are gone too (manual test 9).
+	gone := &sysexec.Fake{Handler: func(c sysexec.Call) ([]byte, error) {
+		if c.Name == "ifconfig" {
+			return nil, &sysexec.CommandError{Call: c, ExitCode: 1, Output: "ifconfig: interface utun4 does not exist\n", Err: errors.New("exit status 1")}
+		}
+		return badAddress(c)
+	}}
+	require.NoError(t, (&Router{Exec: gone}).DeleteRoute(ctx, spec))
+	require.Equal(t, "ifconfig utun4", gone.Calls()[1].String())
+
+	// The interface still exists: "bad address" means something else; keep the error.
+	present := &sysexec.Fake{Handler: func(c sysexec.Call) ([]byte, error) {
+		if c.Name == "ifconfig" {
+			return []byte("utun4: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500\n"), nil
+		}
+		return badAddress(c)
+	}}
+	require.ErrorContains(t, (&Router{Exec: present}).DeleteRoute(ctx, spec), "bad address")
+
+	// A gateway route never takes this path.
+	gw := &sysexec.Fake{Handler: badAddress}
+	require.Error(t, (&Router{Exec: gw}).DeleteRoute(ctx, RouteSpec{Dst: spec.Dst, Gateway: netip.MustParseAddr("192.168.1.1")}))
+	require.Len(t, gw.Calls(), 1)
+}

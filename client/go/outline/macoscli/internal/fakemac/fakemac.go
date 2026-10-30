@@ -460,6 +460,14 @@ func (m *Mac) route(a []string) (string, string) {
 		return "", "route: unsupported destination\n"
 	}
 	rest := a[4:]
+	// Like the real route, an interface name is resolved first: one that no
+	// longer exists (a utun destroyed with its process) is an error, before
+	// the routing table is even looked at (manual test 9).
+	if (verb == "add" || verb == "delete") && len(rest) == 2 && rest[0] == "-interface" {
+		if _, failure := m.ifconfigShow(rest[1]); failure != "" {
+			return "", "route: bad address: " + rest[1] + "\n"
+		}
+	}
 	switch verb {
 	case "get":
 		if r, ok := m.routes[dst]; ok {

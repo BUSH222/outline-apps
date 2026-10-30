@@ -261,10 +261,24 @@ func (r *Router) DeleteRoute(ctx context.Context, spec RouteSpec) error {
 		return err
 	}
 	out, err := r.run(ctx, "route", args...)
-	if err != nil && isNotInTable(out, err) {
+	if err == nil || isNotInTable(out, err) {
+		return nil
+	}
+	// route resolves the interface name before the routing table: for a utun
+	// destroyed with its process (kill -9) it fails with "bad address: utunN".
+	// The kernel removed that interface's routes with it, so they are gone.
+	if spec.Interface != "" && strings.Contains(out+sysexec.OutputOf(err), "bad address") && !r.interfaceExists(ctx, spec.Interface) {
 		return nil
 	}
 	return err
+}
+
+// interfaceExists reports whether a network interface exists ("ifconfig
+// IFACE" only prints). If that can't be told, it says yes, so the caller keeps
+// the error.
+func (r *Router) interfaceExists(ctx context.Context, iface string) bool {
+	out, err := r.run(ctx, "ifconfig", iface)
+	return err == nil || !strings.Contains(out+sysexec.OutputOf(err), "does not exist")
 }
 
 func isNotInTable(out string, err error) bool {
