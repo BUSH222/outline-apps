@@ -53,6 +53,7 @@ type SystemRouter interface {
 	ServiceForInterface(ctx context.Context, iface string) (string, error)
 	DNSServers(ctx context.Context, service string) ([]string, error)
 	SystemResolvers(ctx context.Context, iface string) ([]netip.Addr, error)
+	DHCPResolvers(ctx context.Context, iface string) ([]netip.Addr, error)
 	IPv6(ctx context.Context, service string) (IPv6Config, error)
 	ConfigureUTun(ctx context.Context, name string, local, peer netip.Addr) error
 	LookupRoute(ctx context.Context, dst netip.Prefix) (RouteStatus, error)
@@ -77,6 +78,8 @@ func IsReadOnly(c sysexec.Call) bool {
 	switch c.Name {
 	case "netstat":
 		return true
+	case "ipconfig":
+		return len(c.Args) == 2 && c.Args[0] == "getpacket"
 	case "scutil":
 		return len(c.Args) == 1 && c.Args[0] == "--dns"
 	case "route":
@@ -135,6 +138,18 @@ func (r *Router) SystemResolvers(ctx context.Context, iface string) ([]netip.Add
 	return pickSystemResolvers(parseScutilDNS(out), iface, OutlineDNS), nil
 }
 
+// DHCPResolvers returns the DNS servers the DHCP server of iface handed out.
+// Unlike SystemResolvers, it isn't affected by the CLI's own DNS override, so
+// it works while connected. nil means no lease or no servers.
+func (r *Router) DHCPResolvers(ctx context.Context, iface string) ([]netip.Addr, error) {
+	out, err := r.run(ctx, "ipconfig", "getpacket", iface)
+	if err != nil {
+		// No DHCP lease on this interface (for example a static address).
+		return nil, nil
+	}
+	return parseDHCPResolvers(out), nil
+}
+
 // IPv6 returns a service's IPv6 setting.
 func (r *Router) IPv6(ctx context.Context, service string) (IPv6Config, error) {
 	out, err := r.run(ctx, "networksetup", "-getinfo", service)
@@ -173,6 +188,11 @@ func (r *Router) LookupRoute(ctx context.Context, dst netip.Prefix) (RouteStatus
 			return RouteAbsent, nil
 		}
 		return RouteAbsent, err
+	}
+	if strings.TrimSpace(out) == "" {
+		// No match: route prints its "not in table" error on stderr and may
+		// still exit 0, leaving stdout empty.
+		return RouteAbsent, nil
 	}
 	res, err := parseRouteGet(out)
 	if err != nil {

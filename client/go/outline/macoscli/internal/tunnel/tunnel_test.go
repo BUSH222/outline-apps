@@ -451,12 +451,12 @@ func TestNetworkChange(t *testing.T) {
 	st := s.State()
 	require.Equal(t, "USB 10/100/1000 LAN", st.Service)
 	require.Equal(t, "en7", st.Interface)
-	require.Equal(t, []string{"10.20.0.53"}, st.SystemResolvers)
+	require.Equal(t, []string{"10.20.0.53", "10.20.0.1"}, st.SystemResolvers, "DHCP DNS, then the gateway")
 	require.Len(t, h.netChange, 2, "once at start, once for the change")
 	require.Equal(t, "en0", h.netChange[0].Interface)
 	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.168.1.1")}, h.resolvers[0])
 	require.Equal(t, "en7", h.netChange[1].Interface)
-	require.Equal(t, []netip.Addr{netip.MustParseAddr("10.20.0.53")}, h.resolvers[1])
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("10.20.0.53"), netip.MustParseAddr("10.20.0.1")}, h.resolvers[1])
 
 	// A crash now is still recoverable from the state file alone.
 	h.mac.DestroyUTun("utun7")
@@ -635,4 +635,43 @@ func TestUp_UnreadableLookupOfSomeoneElsesRouteLeavesItAlone(t *testing.T) {
 	got, ok := h.mac.HasRoute("10.0.0.0/8")
 	require.True(t, ok)
 	require.Equal(t, theirs, got)
+}
+
+// Reproduces manual test 3: switching to a phone hotspot keeps the Wi-Fi
+// service and interface but changes the gateway and DNS. The direct
+// resolvers must follow, or the transport can't resolve its server.
+func TestNetworkChange_SameServiceNewNetwork(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+
+	h.mac.SwitchTo(fakemac.Hotspot)
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Len(t, h.resolvers, 2)
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("172.20.10.1")}, h.resolvers[1],
+		"the hotspot's DHCP DNS (also its gateway), not the old 192.168.1.1")
+	require.Equal(t, "Wi-Fi", s.State().Service)
+	require.Equal(t, "169.254.113.53", h.mac.Snapshot().DNS["Wi-Fi"], "the service keeps pointing into the tunnel")
+	route, ok := h.mac.HasRoute("100.200.0.10/32")
+	require.True(t, ok)
+	require.Equal(t, "172.20.10.1", route.Gateway.String())
+
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+}
+
+func TestNetworkChange_ManualDNSIsKept(t *testing.T) {
+	h := newHarness(t, func(m *fakemac.Mac) { m.SetManualDNS("Wi-Fi", []string{"9.9.9.9"}) })
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("9.9.9.9"), netip.MustParseAddr("192.168.1.1")}, h.resolvers[0])
+
+	h.mac.SwitchTo(fakemac.Hotspot)
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("9.9.9.9"), netip.MustParseAddr("172.20.10.1")}, h.resolvers[1],
+		"the user's own DNS servers first, then the new gateway")
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
 }

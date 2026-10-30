@@ -274,6 +274,8 @@ func (m *Mac) dispatch(c sysexec.Call) (string, string) {
 		}
 		m.utuns[a[0]] = a[2]
 		return "", ""
+	case "ipconfig":
+		return m.ipconfig(a)
 	case "dscacheutil", "killall":
 		m.flushes++
 		return "", ""
@@ -465,4 +467,36 @@ func maskString(bits int) string {
 		v = ^uint32(0) << (32 - bits)
 	}
 	return netip.AddrFrom4([4]byte{byte(v >> 24), byte(v >> 16), byte(v >> 8), byte(v)}).String()
+}
+
+// ipconfig answers `ipconfig getpacket IFACE` with the network's DHCP lease,
+// which lists the DHCP-provided DNS servers whatever DNS is set manually.
+func (m *Mac) ipconfig(a []string) (string, string) {
+	if len(a) != 2 || a[0] != "getpacket" {
+		return "", "ipconfig: unsupported arguments\n"
+	}
+	all := append([]*Network(nil), m.others...)
+	if m.primary != nil {
+		all = append(all, m.primary)
+	}
+	for _, n := range all {
+		if n.Service.Device != a[1] {
+			continue
+		}
+		var dns []string
+		for _, r := range n.Resolvers {
+			dns = append(dns, r.String())
+		}
+		return fmt.Sprintf("op = BOOTREPLY\noptions:\nrouter (ip_mult): {%s}\ndomain_name_server (ip_mult): {%s}\nend (none): \n",
+			n.Gateway, strings.Join(dns, ", ")), ""
+	}
+	return "", " "
+}
+
+// Hotspot is a network on the same Wi-Fi interface as WiFi, with its own
+// gateway and DHCP-provided DNS, like an iPhone hotspot.
+var Hotspot = Network{
+	Service:   WiFi.Service,
+	Gateway:   netip.MustParseAddr("172.20.10.1"),
+	Resolvers: []netip.Addr{netip.MustParseAddr("172.20.10.1")},
 }

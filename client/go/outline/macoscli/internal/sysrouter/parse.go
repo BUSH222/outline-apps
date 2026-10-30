@@ -388,3 +388,24 @@ func (r routeGetResult) matches(dst netip.Prefix) bool {
 	}
 	return bits == dst.Bits()
 }
+
+var dhcpDNSLine = regexp.MustCompile(`^domain_name_server\s*\([^)]*\)\s*:\s*\{([^}]*)\}`)
+
+// parseDHCPResolvers parses the DNS servers from `ipconfig getpacket IFACE`,
+// for example "domain_name_server (ip_mult): {172.20.10.1, 8.8.8.8}".
+func parseDHCPResolvers(out string) []netip.Addr {
+	var addrs []netip.Addr
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		m := dhcpDNSLine.FindStringSubmatch(strings.TrimSpace(scanner.Text()))
+		if m == nil {
+			continue
+		}
+		for _, field := range strings.Split(m[1], ",") {
+			if a, err := netip.ParseAddr(strings.TrimSpace(field)); err == nil {
+				addrs = append(addrs, a)
+			}
+		}
+	}
+	return addrs
+}

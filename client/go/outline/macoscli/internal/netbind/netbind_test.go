@@ -93,8 +93,8 @@ func TestUnboundBinderRefusesEverySocket(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotBound)
 	_, err = b.PacketListener().ListenPacket(ctx(t))
 	require.ErrorIs(t, err, ErrNotBound)
-	_, err = b.Resolver().LookupNetIP(ctx(t), "ip4", "example.test")
-	require.Error(t, err)
+	_, err = b.LookupIPv4(ctx(t), "example.test")
+	require.ErrorIs(t, err, ErrNotBound)
 
 	require.Empty(t, calls())
 	select {
@@ -178,42 +178,118 @@ func TestBindFailureFailsTheDial(t *testing.T) {
 func TestSetResolvers(t *testing.T) {
 	b, _ := recordingBinder()
 	require.Equal(t, []netip.AddrPort{FallbackResolver}, b.Resolvers(), "default before capture")
-	b.SetResolvers([]netip.Addr{netip.MustParseAddr("fe80::1%en0"), netip.MustParseAddr("192.168.1.254"), netip.MustParseAddr("::ffff:10.0.0.53")})
+	b.SetResolvers([]netip.Addr{
+		netip.MustParseAddr("fe80::1%en0"),
+		netip.MustParseAddr("192.168.1.254"),
+		netip.MustParseAddr("::ffff:10.0.0.53"),
+		netip.MustParseAddr("192.168.1.254"),
+	})
 	require.Equal(t, []netip.AddrPort{
 		netip.MustParseAddrPort("192.168.1.254:53"),
 		netip.MustParseAddrPort("10.0.0.53:53"),
-	}, b.Resolvers())
+		FallbackResolver,
+	}, b.Resolvers(), "IPv4 only, deduplicated, public fallback last")
 	b.SetResolvers([]netip.Addr{netip.MustParseAddr("2001:db8::53")})
-	require.Equal(t, []netip.AddrPort{FallbackResolver}, b.Resolvers(), "IPv6-only capture falls back")
+	require.Equal(t, []netip.AddrPort{FallbackResolver}, b.Resolvers())
 }
 
-func TestResolverDialsTheDirectServersInOrder(t *testing.T) {
+// fakeDNS answers every A query with answer, on loopback UDP.
+func fakeDNS(t *testing.T, answer netip.Addr) netip.AddrPort {
+	t.Helper()
+	pc, err := net.ListenPacket("udp4", "127.0.0.1:0")
+	require.NoError(t, err)
+	t.Cleanup(func() { pc.Close() })
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, from, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if reply := dnsReply(buf[:n], answer); reply != nil {
+				pc.WriteTo(reply, from)
+			}
+		}
+	}()
+	return netip.MustParseAddrPort(pc.LocalAddr().String())
+}
+
+// dnsReply builds a minimal response to one question: one A record for an A
+// query, no records otherwise.
+func dnsReply(q []byte, answer netip.Addr) []byte {
+	if len(q) < 12 {
+		return nil
+	}
+	end := 12
+	for end < len(q) && q[end] != 0 {
+		end += int(q[end]) + 1
+	}
+	end += 5 // zero label, type, class
+	if end > len(q) {
+		return nil
+	}
+	question := q[12:end]
+	qtype := uint16(question[len(question)-4])<<8 | uint16(question[len(question)-3])
+	ancount := byte(0)
+	if qtype == 1 {
+		ancount = 1
+	}
+	resp := []byte{q[0], q[1], 0x81, 0x80, 0, 1, 0, ancount, 0, 0, 0, 0}
+	resp = append(resp, question...)
+	if ancount == 1 {
+		a := answer.As4()
+		resp = append(resp, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4, a[0], a[1], a[2], a[3])
+	}
+	return resp
+}
+
+func TestLookupIPv4FailsOverToTheNextResolver(t *testing.T) {
 	b, calls := recordingBinder()
 	require.NoError(t, b.SetInterface("en0"))
 
-	// A closed port first (refused), then a listening one.
-	closed, err := net.Listen("tcp4", "127.0.0.1:0")
+	// The first resolver is gone, like the previous network's router; UDP to a
+	// closed loopback port fails at once with "connection refused".
+	dead, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, err)
-	closedAddr := netip.MustParseAddrPort(closed.Addr().String())
-	closed.Close()
-	open, _ := listenTCP(t)
-	servers := []netip.AddrPort{closedAddr, netip.MustParseAddrPort(open)}
+	deadAddr := netip.MustParseAddrPort(dead.LocalAddr().String())
+	dead.Close()
+	live := fakeDNS(t, netip.MustParseAddr("100.200.0.10"))
+	servers := []netip.AddrPort{deadAddr, live}
 	b.resolvers.Store(&servers)
 
-	// The address the Go resolver asks for (the system's, possibly the
-	// tunnel's 169.254.113.53) must be ignored.
-	conn, err := b.Resolver().Dial(ctx(t), "tcp", "169.254.113.53:53")
+	addrs, err := b.LookupIPv4(ctx(t), "server.example.test")
 	require.NoError(t, err)
-	require.Equal(t, open, conn.RemoteAddr().String())
-	conn.Close()
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("100.200.0.10")}, addrs)
 	for _, c := range calls() {
-		require.Equal(t, bindCall{"tcp4", 6}, c, "resolver sockets are bound too")
+		require.Equal(t, bindCall{"udp4", 6}, c, "resolver sockets are bound too")
 	}
+}
 
-	uconn, err := b.Resolver().Dial(ctx(t), "udp", "169.254.113.53:53")
+func TestLookupIPv4ReportsEveryResolver(t *testing.T) {
+	b, _ := recordingBinder()
+	require.NoError(t, b.SetInterface("en0"))
+	dead, err := net.ListenPacket("udp4", "127.0.0.1:0")
 	require.NoError(t, err)
-	require.Equal(t, closedAddr.String(), uconn.RemoteAddr().String(), "UDP connect doesn't fail, so the first server is used")
-	uconn.Close()
+	deadAddr := netip.MustParseAddrPort(dead.LocalAddr().String())
+	dead.Close()
+	servers := []netip.AddrPort{deadAddr}
+	b.resolvers.Store(&servers)
+	_, err = b.LookupIPv4(ctx(t), "server.example.test")
+	require.ErrorContains(t, err, "via "+deadAddr.String())
+}
+
+func TestStreamDialerResolvesHostNamesDirectly(t *testing.T) {
+	b, _ := recordingBinder()
+	require.NoError(t, b.SetInterface("en0"))
+	addr, accepted := listenTCP(t)
+	_, port, _ := net.SplitHostPort(addr)
+	servers := []netip.AddrPort{fakeDNS(t, netip.MustParseAddr("127.0.0.1"))}
+	b.resolvers.Store(&servers)
+
+	conn, err := b.StreamDialer().DialStream(ctx(t), net.JoinHostPort("server.example.test", port))
+	require.NoError(t, err)
+	conn.Close()
+	<-accepted
 }
 
 func TestDialLogging(t *testing.T) {

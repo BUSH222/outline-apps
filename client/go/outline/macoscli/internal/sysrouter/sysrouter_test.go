@@ -473,3 +473,64 @@ func TestRouter_LookupRouteErrorShowsTheOutput(t *testing.T) {
 	require.ErrorContains(t, err, "no destination in route output")
 	require.ErrorContains(t, err, "something unexpected")
 }
+
+// The documented `ipconfig getpacket` format; values are from a typical
+// iPhone hotspot.
+const getpacketFixture = `op = BOOTREPLY
+htype = 1
+flags = 0
+hlen = 6
+hops = 0
+xid = 0x5a1b2c3d
+ciaddr = 0.0.0.0
+yiaddr = 172.20.10.4
+siaddr = 172.20.10.1
+giaddr = 0.0.0.0
+chaddr = 02:00:00:00:00:03
+sname = 
+file = 
+options:
+Options count is 8
+dhcp_message_type (uint8): ACK 0x5
+server_identifier (ip): 172.20.10.1
+lease_time (uint32): 0x15180
+subnet_mask (ip): 255.255.255.240
+router (ip_mult): {172.20.10.1}
+domain_name_server (ip_mult): {172.20.10.1, 8.8.8.8}
+end (none): 
+`
+
+func TestParseDHCPResolvers(t *testing.T) {
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("172.20.10.1"), netip.MustParseAddr("8.8.8.8")},
+		parseDHCPResolvers(getpacketFixture))
+	require.Nil(t, parseDHCPResolvers("op = BOOTREPLY\nrouter (ip_mult): {172.20.10.1}\n"))
+	require.Nil(t, parseDHCPResolvers(""))
+}
+
+func TestRouter_DHCPResolvers(t *testing.T) {
+	r, f := newRouter(func(c sysexec.Call) ([]byte, error) {
+		if c.Args[1] == "en1" {
+			return []byte(getpacketFixture), nil
+		}
+		return nil, cmdErr(c, "") // no lease: ipconfig prints nothing and fails
+	})
+	ctx := context.Background()
+	got, err := r.DHCPResolvers(ctx, "en1")
+	require.NoError(t, err)
+	require.Len(t, got, 2)
+	got, err = r.DHCPResolvers(ctx, "en5")
+	require.NoError(t, err)
+	require.Nil(t, got)
+	require.Equal(t, "ipconfig getpacket en1", f.Calls()[0].String())
+	require.True(t, IsReadOnly(f.Calls()[0]))
+	require.False(t, IsReadOnly(sysexec.Cmd("ipconfig", "set", "en1", "DHCP")))
+}
+
+func TestRouter_LookupRouteEmptyOutputMeansAbsent(t *testing.T) {
+	// Seen on the developer's Mac right after a disconnect: route exits 0,
+	// prints its error on stderr and nothing on stdout.
+	r, _ := newRouter(func(sysexec.Call) ([]byte, error) { return nil, nil })
+	got, err := r.LookupRoute(context.Background(), netip.MustParsePrefix("10.0.0.0/8"))
+	require.NoError(t, err)
+	require.Equal(t, RouteAbsent, got)
+}

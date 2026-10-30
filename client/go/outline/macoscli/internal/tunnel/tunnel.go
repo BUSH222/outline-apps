@@ -169,6 +169,7 @@ func Up(ctx context.Context, opts Options) (_ *Session, err error) {
 	if err != nil {
 		return nil, fmt.Errorf("reading system resolvers: %w", err)
 	}
+	resolvers = appendUnique(resolvers, primary.Gateway)
 	ipv6, err := r.IPv6(ctx, service)
 	if err != nil {
 		return nil, fmt.Errorf("reading IPv6 setting of %q: %w", service, err)
@@ -614,12 +615,15 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 		return err
 	}
 	if service != s.st.Service {
-		if err := s.moveServiceSettings(ctx, service, primary.Interface); err != nil {
+		if err := s.moveServiceSettings(ctx, service); err != nil {
 			return err
 		}
 	}
 	s.st.Interface = primary.Interface
 	s.st.Gateway = addrString(primary.Gateway)
+	// The new network usually has its own DNS servers, even on the same
+	// service (for example another Wi-Fi network, such as a phone hotspot).
+	s.st.SystemResolvers = addrStrings(s.directResolvers(ctx, primary))
 	if err := s.save(); err != nil {
 		return err
 	}
@@ -637,7 +641,7 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 
 // moveServiceSettings restores the old service's DNS and IPv6 and applies the
 // tunnel settings to the new service.
-func (s *Session) moveServiceSettings(ctx context.Context, service, iface string) error {
+func (s *Session) moveServiceSettings(ctx context.Context, service string) error {
 	r := s.opts.Router
 	if s.st.PrevDNS != nil {
 		if err := r.SetDNS(ctx, s.st.Service, s.st.PrevDNS.Servers); err != nil {
@@ -662,9 +666,6 @@ func (s *Session) moveServiceSettings(ctx context.Context, service, iface string
 	ipv6, err := r.IPv6(ctx, service)
 	if err != nil {
 		return err
-	}
-	if resolvers, err := r.SystemResolvers(ctx, iface); err == nil && len(resolvers) > 0 {
-		s.st.SystemResolvers = addrStrings(resolvers)
 	}
 	s.st.Service = service
 	return s.applyServiceSettings(ctx, service, dns, ipv6)
@@ -716,4 +717,36 @@ func parseAddrs(ss []string) []netip.Addr {
 		}
 	}
 	return out
+}
+
+// directResolvers chooses the DNS servers for the CLI's own lookups on a
+// network, while the service's DNS points into the tunnel (so scutil only
+// shows the tunnel's address):
+//  1. the DNS servers the user set on the service, if any (they don't depend
+//     on the network);
+//  2. otherwise the servers the network's DHCP handed out;
+//  3. then the gateway, which usually answers DNS too.
+//
+// The binder adds a public resolver as the last resort.
+func (s *Session) directResolvers(ctx context.Context, primary sysrouter.DefaultRoute) []netip.Addr {
+	var resolvers []netip.Addr
+	if s.st.PrevDNS != nil && s.st.PrevDNS.Servers != nil {
+		resolvers = parseAddrs(s.st.PrevDNS.Servers)
+	} else if dhcp, err := s.opts.Router.DHCPResolvers(ctx, primary.Interface); err == nil {
+		resolvers = dhcp
+	}
+	return appendUnique(resolvers, primary.Gateway)
+}
+
+// appendUnique appends a to list unless it is invalid or already there.
+func appendUnique(list []netip.Addr, a netip.Addr) []netip.Addr {
+	if !a.IsValid() {
+		return list
+	}
+	for _, x := range list {
+		if x == a {
+			return list
+		}
+	}
+	return append(list, a)
 }

@@ -27,6 +27,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"strings"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -41,7 +42,9 @@ var ErrNotBound = errors.New("no physical interface to bind to yet")
 // captured (decision D2).
 var FallbackResolver = netip.MustParseAddrPort("1.1.1.1:53")
 
-const resolverDialTimeout = 5 * time.Second
+// resolverTimeout bounds one lookup on one resolver, so a dead resolver (for
+// example the previous network's router) is skipped quickly.
+const resolverTimeout = 3 * time.Second
 
 // BindFunc binds a socket to an interface index. network is the socket's
 // network as net.Dialer.Control sees it ("tcp4", "udp6", ...).
@@ -134,22 +137,29 @@ func (b *Binder) Interface() (string, int) {
 	return *name, int(b.ifIndex.Load())
 }
 
-// SetResolvers sets the resolvers for direct lookups. Only IPv4 addresses are
-// kept (IPv6 is off during a session); with none left, FallbackResolver is used.
+// SetResolvers sets the resolvers for direct lookups, tried in order. Only
+// IPv4 addresses are kept (IPv6 is off during a session), and
+// FallbackResolver is always tried last.
 func (b *Binder) SetResolvers(addrs []netip.Addr) {
 	var servers []netip.AddrPort
+	add := func(s netip.AddrPort) {
+		for _, x := range servers {
+			if x == s {
+				return
+			}
+		}
+		servers = append(servers, s)
+	}
 	for _, a := range addrs {
 		if a = a.Unmap(); a.Is4() {
-			servers = append(servers, netip.AddrPortFrom(a, 53))
+			add(netip.AddrPortFrom(a, 53))
 		}
 	}
-	if len(servers) == 0 {
-		servers = []netip.AddrPort{FallbackResolver}
-	}
+	add(FallbackResolver)
 	b.resolvers.Store(&servers)
 }
 
-// Resolvers returns the resolvers for direct lookups.
+// Resolvers returns the resolvers for direct lookups, in the order they are tried.
 func (b *Binder) Resolvers() []netip.AddrPort {
 	if r := b.resolvers.Load(); r != nil {
 		return *r
@@ -178,15 +188,41 @@ func (b *Binder) dialer() *net.Dialer {
 	return &net.Dialer{
 		KeepAlive: -1, // like the app's base TCP dialer
 		Control:   b.Control,
-		Resolver:  b.Resolver(),
 	}
 }
 
-// StreamDialer dials bound IPv4 TCP connections. Host names are resolved with
-// Resolver, never through the tunnel.
+// dial connects a bound IPv4 socket. A host name is resolved with LookupIPv4
+// (never through the tunnel) and each address is tried in turn.
+func (b *Binder) dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, err
+	}
+	if ip, err := netip.ParseAddr(host); err == nil {
+		return b.dialer().DialContext(ctx, network, net.JoinHostPort(ip.Unmap().String(), port))
+	}
+	ips, err := b.LookupIPv4(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolving %s: %w", host, err)
+	}
+	var errs []error
+	for _, ip := range ips {
+		conn, err := b.dialer().DialContext(ctx, network, net.JoinHostPort(ip.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		errs = append(errs, err)
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, errors.Join(errs...)
+}
+
+// StreamDialer dials bound IPv4 TCP connections.
 func (b *Binder) StreamDialer() transport.StreamDialer {
 	return transport.FuncStreamDialer(func(ctx context.Context, addr string) (transport.StreamConn, error) {
-		conn, err := b.dialer().DialContext(ctx, "tcp4", addr)
+		conn, err := b.dial(ctx, "tcp4", addr)
 		b.logDial("tcp4", addr, conn, err)
 		if err != nil {
 			return nil, err
@@ -198,7 +234,7 @@ func (b *Binder) StreamDialer() transport.StreamDialer {
 // PacketDialer dials bound IPv4 UDP connections.
 func (b *Binder) PacketDialer() transport.PacketDialer {
 	return transport.FuncPacketDialer(func(ctx context.Context, addr string) (net.Conn, error) {
-		conn, err := b.dialer().DialContext(ctx, "udp4", addr)
+		conn, err := b.dial(ctx, "udp4", addr)
 		b.logDial("udp4", addr, conn, err)
 		return conn, err
 	})
@@ -217,27 +253,49 @@ func (l packetListener) ListenPacket(ctx context.Context) (net.PacketConn, error
 	return lc.ListenPacket(ctx, "udp4", "0.0.0.0:0")
 }
 
-// Resolver returns a Go resolver whose queries go to the direct resolvers over
-// bound sockets, trying each in turn. The address the resolver asks for (from
-// /etc/resolv.conf) is ignored: during a session it would be the tunnel's.
-func (b *Binder) Resolver() *net.Resolver {
-	return &net.Resolver{
+// LookupIPv4 resolves host to IPv4 addresses through the direct resolvers,
+// over bound sockets, trying each resolver in turn (with its own timeout)
+// until one answers. The system resolver is never used: during a session it
+// points into the tunnel.
+func (b *Binder) LookupIPv4(ctx context.Context, host string) ([]netip.Addr, error) {
+	if b.ifIndex.Load() <= 0 {
+		return nil, ErrNotBound
+	}
+	var errs []error
+	for _, server := range b.Resolvers() {
+		addrs, err := b.lookupWith(ctx, server, host)
+		if err == nil && len(addrs) > 0 {
+			return addrs, nil
+		}
+		if err == nil {
+			err = errors.New("no IPv4 address")
+		}
+		errs = append(errs, fmt.Errorf("via %s: %w", server, err))
+		if ctx.Err() != nil {
+			break
+		}
+	}
+	return nil, errors.Join(errs...)
+}
+
+func (b *Binder) lookupWith(ctx context.Context, server netip.AddrPort, host string) ([]netip.Addr, error) {
+	ctx, cancel := context.WithTimeout(ctx, resolverTimeout)
+	defer cancel()
+	r := &net.Resolver{
 		PreferGo: true,
+		// The address the Go resolver asks for comes from /etc/resolv.conf;
+		// it is ignored in favor of server.
 		Dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
 			network4 := "udp4"
-			if network == "tcp" || network == "tcp4" || network == "tcp6" {
+			if strings.HasPrefix(network, "tcp") {
 				network4 = "tcp4"
 			}
-			d := net.Dialer{Control: b.Control, Timeout: resolverDialTimeout}
-			var errs []error
-			for _, server := range b.Resolvers() {
-				conn, err := d.DialContext(ctx, network4, server.String())
-				if err == nil {
-					return conn, nil
-				}
-				errs = append(errs, err)
-			}
-			return nil, fmt.Errorf("no direct DNS resolver reachable: %w", errors.Join(errs...))
+			return b.dialer().DialContext(ctx, network4, server.String())
 		},
 	}
+	addrs, err := r.LookupNetIP(ctx, "ip4", host)
+	for i, a := range addrs {
+		addrs[i] = a.Unmap()
+	}
+	return addrs, err
 }
