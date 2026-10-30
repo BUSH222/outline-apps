@@ -295,7 +295,7 @@ Approved by the developer: when the binder can't look up a first-hop host name (
   - Disconnected form: `block drop out quick from any to <outline_vpn_only>`.
   - Connected form: `pass out quick on utunN from any to <outline_vpn_only>` first. No address family, so both IPv4 and IPv6 are covered. No physical interface is named.
   - pf is enabled with `pfctl -E`; its reference token (printed on standard error, hence `Call.CombinedOutput`) is kept in `lockdown.json` and released by `unlock` with `pfctl -X`.
-  - If `pfctl -s rules` shows no `anchor "com.apple/*"`: with an empty main ruleset (nothing loaded since boot), `/etc/pf.conf` is loaded, provided it has that anchor; a non-empty main ruleset without it is someone else's setup, and lockdown fails with an error instead of changing it. **N4 is still unverified** on the real Mac.
+  - If `pfctl -s rules` shows no `anchor "com.apple/*"`: with an empty main ruleset (nothing loaded since boot), `/etc/pf.conf` is loaded, provided it has that anchor; a non-empty main ruleset without it is someone else's setup, and lockdown fails with an error instead of changing it. N4 was confirmed by manual test 9 (section 20).
 - **hosts:** a block between `# BEGIN outline-cli ...` and `# END outline-cli` with `0.0.0.0 NAME` and `:: NAME` for each entry without `*.`. It's a pure text transform (golden-tested), written atomically, keeping the file's mode; a one-time backup goes to `hosts.backup`.
 - `lockdown.json` is written **before** anything is installed, so an interrupted lockdown is finished by `cleanup`.
 - **Lifecycle:**
@@ -307,3 +307,24 @@ Approved by the developer: when the binder can't look up a first-hop host name (
 - `lockdown` never resolves names itself (that would leak the lookups); the table holds what sessions learned.
 - `pfctl` reads (`-s info`, `-s rules`, `-a ANCHOR -s rules`) are on the dry-run allowlist; every other `pfctl` call counts as a change. The simulated Mac models pf (enable references, main ruleset, anchors, reboot).
 - Tests never touch `/etc/hosts` or `/etc/pf.conf`: the lockdown manager has no default paths, and the test environment always passes temporary files.
+
+## 20. Manual test 9 (developer's Mac, 2026-10-30): VPN-only and lockdown work; crash cleanup failed
+
+**Passed:**
+- Connect, the bypass list and the vpn_only list worked as before; while connected, the vpn_only site showed the server's IP.
+- `lockdown --dry-run` listed the IPv4 and IPv6 address learned through the tunnel; `lockdown` installed them.
+- While disconnected: the site was blocked by name (`dscacheutil` gave `0.0.0.0` and `::`) and by address (`curl --resolve` to the learned address timed out, exit 28); other sites worked.
+- **N4 holds:** the anchor loaded under the stock main ruleset (`pfctl -s rules` shows `anchor "com.apple/*" all`), its table held the addresses, and pf applied the block. `/etc/pf.conf` was not touched.
+- Reconnecting made the site reachable through the tunnel again.
+- After `kill -9` while connected, the site stayed blocked (the pass rule names a utun that no longer exists), and `cleanup` re-installed the lockdown.
+
+**Bug: `cleanup` failed after the crash, and so did every later `cleanup` and `connect`:**
+- `route -n delete -net 0.0.0.0/1 -interface utun4` failed with `route: bad address: utun4` (exit 68). The kernel had already removed the utun **and** its routes (N3), but `route` resolves the interface name before it looks at the routing table, so for a missing interface it never gets to "not in table" (the error the CLI accepted as "already gone").
+- `cleanup` had restored DNS, IPv6 and the gateway routes on its first run; only the three utun routes stayed in the state file, and each retry failed the same way. `connect` runs the same recovery first, so it refused to start.
+- The simulated Mac answered "not in table" in this case, so the 48 crash tests never saw it.
+
+**Fix:** when deleting an interface route fails with "bad address" and `ifconfig IFACE` (read-only) says the interface doesn't exist, the route counts as deleted. The simulated Mac now answers like the real `route` (an interface that doesn't exist is "bad address", for add and delete), and with the old code the crash tests fail with exactly the error from this test.
+
+Also seen: `ifconfig.me` now has an IPv6 address (the AAAA lookup through the tunnel found one), unlike in manual test 3 (section 11). The IPv6 leak check in `MANUAL_TEST.md` uses `ipv6.icanhazip.com` anyway.
+
+Also seen: after the crash, `netstat` showed `169.254.113.53 link#7 UHRLSW en1 !`. That is macOS's own entry, cloned from the on-link `169.254/16` route when something kept querying the old DNS address; it isn't the CLI's and expires by itself.

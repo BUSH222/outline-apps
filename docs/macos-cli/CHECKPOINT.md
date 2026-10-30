@@ -1,4 +1,4 @@
-# macOS CLI: checkpoint (2026-10-30, M5 code done, waiting for manual test 9)
+# macOS CLI: checkpoint (2026-10-30, end of M5)
 
 Read this first if you are picking up this work. It says where things stand, which rules apply, what was learned the hard way, and what comes next. Details live in:
 
@@ -9,7 +9,7 @@ Read this first if you are picking up this work. It says where things stand, whi
 
 ## 1. What this is
 
-`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4, confirmed on the real Mac) and a VPN-only list with `lockdown`/`unlock` (M5, code done, not yet tested on the real Mac). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
+`outline-cli` is a root-run Outline VPN client for macOS that doesn't use the Network Extension. It accepts static (`ss://`) and dynamic (`ssconf://`, `https://`) keys. Traffic goes into a `utun` through the app's own Go transport (`configregistry` + `vpn.ConnectRemoteDevice` / lwIP). It has a bypass list (domains that never use the VPN, M4, confirmed on the real Mac) and a VPN-only list with `lockdown`/`unlock` (M5, confirmed on the real Mac). Still to come: a VPN-only list (domains blocked unless the VPN is up, M5).
 
 Code: `client/go/outline/macoscli/`. Branch: `feat/macos-cli` on `origin` (the developer's fork `BUSH222/outline-apps`). `master` is untouched.
 
@@ -71,7 +71,7 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 | M2 Tunnel manager, state file, cleanup, crash safety | Done |
 | M3 Interface binding, real `connect` | **Done and confirmed on the real Mac** (manual tests 1–6: connect, both post-routing checks, disconnect, crash recovery, IPv6 leak check, a 2.4/5 GHz network switch, and a quick phone-hotspot switch) |
 | M4 Bypass list | **Done and confirmed on the real Mac** (manual test 7 found that bypass needs host routes; manual test 8 passed with them) |
-| M5 VPN-only list | **Code done, gate passed locally; waiting for manual test 9** (`MANUAL_TEST.md` section 8) |
+| M5 VPN-only list | **Done and confirmed on the real Mac** (manual test 9; it also found a crash-cleanup bug, now fixed, whose fix still needs one re-run of `MANUAL_TEST.md` section 5) |
 | M6 Universal artifact, README, final `MANUAL_TEST.md` | Partly done (CI already produces the signed universal artifact; README not written) |
 
 ## 5. How the code fits together
@@ -144,6 +144,7 @@ internal/dnstest   DNS message builders for tests
 10. `go test -race` prints `ld: warning: ... malformed LC_DYSYMTAB`. It is harmless.
 11. Upstream's "Go Backend Test" runs `go test ./client/...` on Ubuntu, which includes these packages. Keep darwin-only code behind build tags with stubs. Our workflow's `linux-tests` job guards this.
 12. **A socket bound to the primary interface can't reach an address whose only matching routes are on the utun** (`network is unreachable`); the plain `default` route isn't used for it. Bound sockets work only towards destinations with a route on the physical interface (host routes, excluded ranges). That's why bypass addresses get host routes (manual test 7).
+13. **`route ... -interface utunN` fails with `bad address: utunN` once the utun is gone**, before it looks at the routing table, so a deleted route isn't reported as "not in table". `DeleteRoute` treats it as gone when `ifconfig` confirms the interface doesn't exist (manual test 9).
 
 ## 7. M4 (bypass list): where it stands
 
@@ -166,7 +167,7 @@ Done (details in `FINDINGS.md` section 19):
 - Part B: `lockdown [--rules] [--dry-run]` and `unlock` (`lockdown.go`); `connect` switches an active lockdown to the connected form and back; `cleanup` and crash recovery re-install it; only `unlock` removes it.
 - Tests: golden anchor and hosts text; exact `pfctl` sequences for lock, connect, learn, disconnect, unlock, reboot plus cleanup, and a foreign main ruleset; CLI tests for every command, using temporary hosts files only.
 
-Waiting for the developer: `MANUAL_TEST.md` section 8 (manual test 9), which also checks N4 (the anchor loads and is evaluated without editing `/etc/pf.conf`).
+- **Manual test 9 passed** (FINDINGS 20), including N4. It found that `cleanup` after `kill -9` failed on `route: bad address: utunN` (the utun is gone, so `route` can't resolve it); fixed in `sysrouter.DeleteRoute`, and the simulated Mac now behaves the same way. Waiting for one re-run of the crash test (`MANUAL_TEST.md` section 5) with the fix.
 
 ## 8b. After M5
 

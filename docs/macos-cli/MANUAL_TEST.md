@@ -24,6 +24,7 @@ Try these in order. Each step is safe to repeat.
    sudo dscacheutil -flushcache; sudo killall -HUP mDNSResponder
    ```
    Host routes for bypass addresses (`netstat -rn -f inet` shows them as single addresses via your router, flags `UGHS`) are harmless if left over, and a reboot clears them; `cleanup` removes them too.
+   If `cleanup` (from a build older than this fix) keeps failing with `route: bad address: utunN` after a crash: macOS already removed those routes with the utun. Check that `netstat -rn -f inet | grep -E 'utun|^0/1|^128.0/1'` prints nothing, then delete the stale state file: `sudo rm /var/db/outline-cli/state.json`.
    If you had set DNS servers or a manual IPv6 address yourself before connecting, the previous values are in the state file: `sudo cat /var/db/outline-cli/state.json` (see `prevDNS` and `prevIPv6`).
 4. **A site stays blocked** although you ran `unlock`, or `outline-cli` is gone: remove the lockdown by hand.
    ```sh
