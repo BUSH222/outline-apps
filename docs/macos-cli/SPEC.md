@@ -129,6 +129,7 @@ Rules file (YAML), suggested schema:
 ```yaml
 bypass:                 # matches the domain and all subdomains
   - lichess.org
+  - "*.example.org"     # a leading "*." matches subdomains only (not resolved ahead of time)
 vpn_only:               # see 6.3
   - example.com
 direct_dns: []          # optional; default = the system resolvers captured before DNS was overridden

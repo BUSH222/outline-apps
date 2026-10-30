@@ -212,3 +212,35 @@ Baseline without the VPN: about 6 s to switch.
 ## 14. Manual test 6 (developer's Mac, 2026-10-30): network switch recovers
 
 With commit `bd37e0bf`, switching between the router's 2.4 GHz and 5 GHz networks while connected recovers: the routes are re-created with the new address, and traffic flows through the tunnel again. **M3 is confirmed on the developer's Mac** for connect, checks, disconnect, crash recovery, an IPv6 leak check and a same-router network switch. A later quick test with the same build showed that switching to a phone hotspot (a different router) recovers too.
+
+## 15. M4 notes (bypass list)
+
+**Step 0: does binding alone escape the tunnel?** Bypass traffic goes to arbitrary addresses with no host route, so this had to be checked before relying on it.
+- A plain bound `connect` can't tell: lwIP accepts every TCP connection itself, so a socket that wrongly entered the utun would also "connect".
+- Instead, a third post-routing check (log-only, never fatal) asks `1.1.1.1` for `whoami.cloudflare` (class CH, type TXT, over TCP), which answers with the asker's public address. It asks once through a bound socket and once through the tunnel, and only says whether the two differ; the addresses aren't logged.
+- **Not yet run on the real Mac.** If it fails, bypass needs `/32` gateway routes for learned addresses (journaled like the other routes) instead of binding alone.
+
+**Dependency:** `golang.org/x/net v0.44.0` was already in the local module cache by M4, so nothing was fetched. `go mod tidy` only moved it from the indirect block to the direct one; `go.sum` is unchanged.
+
+**Design as built:**
+- `internal/rules`: strict YAML (unknown or duplicate keys are errors, so a typo can't silently drop a rule). `example.com` covers the domain and its subdomains; `*.example.com` covers only subdomains. Names are lowercased and converted to punycode with `idna.Lookup`. IP addresses, URLs, ports and other wildcards are refused. `direct_dns` (IPv4 only) is supported as in SPEC 6.2. A bypass entry that a `vpn_only` entry covers triggers a warning.
+- `internal/ipcache`: one expiry per class per address, so a bypass answer never hides a vpn_only one; vpn_only wins while both are valid. TTLs are clamped to `[min_ttl, max_ttl]`.
+- `internal/dnsrelay`:
+  - A query goes direct only if every question is a bypass name; any vpn_only question sends it through the tunnel. Malformed messages go through the tunnel untouched.
+  - Every answer (direct or through the tunnel) is read on the way back. The CNAME chain is followed from the question name; its class is the strongest of any name in it, and its TTL the smallest.
+  - Direct resolvers are the binder's (manual DNS, else DHCP, then the gateway, then `1.1.1.1`), or `direct_dns`. Each is tried for 3 s; SERVFAIL and REFUSED move on to the next. If all fail, the query goes through the tunnel (D2).
+  - **TCP:** queries are read from the 2-byte-framed stream; replies are written back as they arrive. **Deviation from the plan:** replies on the shared tunnel connection are not matched by ID. Each reply carries its own question (that is what is learned from), replies go back on the same client connection, and RFC 7766 lets them arrive out of order; the client matches IDs itself.
+  - Truncated (TC) replies are passed on unchanged; the client retries over TCP, which takes the same path.
+- `internal/route`: wraps the parsed `TransportPair`, keeping its connection type, first hop and `NotifyNetworkChanged`.
+  - Bypass addresses use the binder's dialer, or a direct UDP relay on the binder's listener (30 s idle timeout), with **no fallback** to the tunnel.
+  - vpn_only and unknown addresses use the transport; vpn_only never goes direct, even when the tunnel fails.
+  - Host names (only from the transport's own checks) go through the transport.
+  - UDP associations are modeled on the SDK's `dnsintercept`: sub-associations are created on first use and replaced if they end; the association closes itself once nothing is active, so lwIP releases the app's socket, as upstream does.
+- **Wiring:** with an empty or missing rules file, the transport isn't wrapped at all, so M3 behavior is unchanged. With rules, lwIP gets the router; the post-routing checks use the bare transport.
+- **Pre-resolution:** names listed without `*.` (and not overridden by vpn_only) are resolved directly once connected, and again at 80% of their clamped TTL; failures retry after 30 s.
+
+**Limits found:**
+- The pinned `dnsmessage` has no SVCB/HTTPS record type, so `ipv4hint` addresses in HTTPS records aren't learned. Writing a parser for them was ruled out (no hand-written DNS parsing).
+- The others (DoH, connections opened before a mapping exists, shared CDN addresses, OS and app DNS caches) are listed in `MANUAL_TEST.md` section 7.
+
+**vpn_only in M4:** such addresses are already kept off the direct path. Refusing a transport that isn't fully tunneled (D8) and `lockdown`/`unlock` come in M5.
