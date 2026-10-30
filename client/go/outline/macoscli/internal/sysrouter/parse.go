@@ -409,3 +409,20 @@ func parseDHCPResolvers(out string) []netip.Addr {
 	}
 	return addrs
 }
+
+// parseInetAddrs returns the IPv4 addresses ("inet A.B.C.D netmask ...")
+// from `ifconfig IFACE`.
+func parseInetAddrs(out string) []netip.Addr {
+	var addrs []netip.Addr
+	scanner := bufio.NewScanner(strings.NewReader(out))
+	for scanner.Scan() {
+		fields := strings.Fields(scanner.Text())
+		if len(fields) < 2 || fields[0] != "inet" {
+			continue
+		}
+		if a, err := netip.ParseAddr(fields[1]); err == nil && a.Is4() {
+			addrs = append(addrs, a)
+		}
+	}
+	return addrs
+}

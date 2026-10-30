@@ -42,6 +42,7 @@ type Network struct {
 	Service   Service
 	Gateway   netip.Addr
 	Resolvers []netip.Addr // DHCP-provided
+	Address   netip.Addr   // the Mac's own IPv4 address on this network
 }
 
 // Snapshot is the comparable part of the system state.
@@ -62,7 +63,11 @@ type Mac struct {
 	others   []*Network
 	routes   map[netip.Prefix]sysrouter.RouteSpec
 	cloned   map[netip.Prefix]bool // kernel cache entries (WASCLONED)
-	dns      map[string][]string   // manual DNS; nil = DHCP
+	// srcs records the interface address a gateway route captured when it
+	// was added. Like the macOS kernel, the route keeps using it even after
+	// the interface's address changes.
+	srcs     map[netip.Prefix]netip.Addr
+	dns      map[string][]string // manual DNS; nil = DHCP
 	ipv6     map[string]sysrouter.IPv6Config
 	utuns    map[string]string
 	flushes  int
@@ -79,6 +84,7 @@ var WiFi = Network{
 	Service:   Service{Name: "Wi-Fi", Device: "en0"},
 	Gateway:   netip.MustParseAddr("192.168.1.1"),
 	Resolvers: []netip.Addr{netip.MustParseAddr("192.168.1.1")},
+	Address:   netip.MustParseAddr("192.168.1.23"),
 }
 
 // Ethernet is a second network on en7.
@@ -86,6 +92,7 @@ var Ethernet = Network{
 	Service:   Service{Name: "USB 10/100/1000 LAN", Device: "en7"},
 	Gateway:   netip.MustParseAddr("10.20.0.1"),
 	Resolvers: []netip.Addr{netip.MustParseAddr("10.20.0.53")},
+	Address:   netip.MustParseAddr("10.20.0.23"),
 }
 
 // New returns a Mac on Wi-Fi with IPv6 Automatic, DHCP DNS and the usual
@@ -97,6 +104,7 @@ func New() *Mac {
 		primary:  &wifi,
 		routes:   map[netip.Prefix]sysrouter.RouteSpec{},
 		cloned:   map[netip.Prefix]bool{},
+		srcs:     map[netip.Prefix]netip.Addr{},
 		dns:      map[string][]string{},
 		ipv6: map[string]sysrouter.IPv6Config{
 			WiFi.Service.Name:     {Mode: sysrouter.IPv6Automatic, Raw: "Automatic"},
@@ -151,6 +159,32 @@ func (m *Mac) SwitchTo(n Network) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.primary = &n
+}
+
+// ChangeAddress gives the Mac a new address on the current network, as when
+// rejoining the same router on another band and getting a new DHCP lease.
+func (m *Mac) ChangeAddress(a netip.Addr) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.primary != nil {
+		m.primary.Address = a
+	}
+}
+
+// StaleRoutes lists gateway routes that still use an interface address the
+// Mac no longer has. Connections over them fail with "can't assign
+// requested address".
+func (m *Mac) StaleRoutes() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	var stale []string
+	for dst, src := range m.srcs {
+		if m.primary == nil || src != m.primary.Address {
+			stale = append(stale, m.routes[dst].String())
+		}
+	}
+	sort.Strings(stale)
+	return stale
 }
 
 // GoOffline removes the default route.
@@ -269,6 +303,9 @@ func (m *Mac) dispatch(c sysexec.Call) (string, string) {
 	case "route":
 		return m.route(a)
 	case "ifconfig":
+		if len(a) == 1 {
+			return m.ifconfigShow(a[0])
+		}
 		if len(a) < 4 || !strings.HasPrefix(a[0], "utun") {
 			return "", "ifconfig: unexpected arguments\n"
 		}
@@ -449,6 +486,9 @@ func (m *Mac) route(a []string) (string, string) {
 			return "", "route: writing to routing socket: File exists\nadd net " + dst.String() + ": File exists\n"
 		}
 		m.routes[dst] = spec
+		if spec.Gateway.IsValid() && m.primary != nil {
+			m.srcs[dst] = m.primary.Address
+		}
 		return "add net " + dst.String() + "\n", ""
 	case "delete":
 		if _, ok := m.routes[dst]; !ok {
@@ -456,6 +496,7 @@ func (m *Mac) route(a []string) (string, string) {
 		}
 		delete(m.routes, dst)
 		delete(m.cloned, dst)
+		delete(m.srcs, dst)
 		return "delete net " + dst.String() + "\n", ""
 	}
 	return "", "route: unsupported verb\n"
@@ -499,4 +540,31 @@ var Hotspot = Network{
 	Service:   WiFi.Service,
 	Gateway:   netip.MustParseAddr("172.20.10.1"),
 	Resolvers: []netip.Addr{netip.MustParseAddr("172.20.10.1")},
+	Address:   netip.MustParseAddr("172.20.10.4"),
+}
+
+// ifconfigShow answers `ifconfig IFACE`.
+func (m *Mac) ifconfigShow(iface string) (string, string) {
+	if addr, ok := m.utuns[iface]; ok {
+		return iface + ": flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1500\n\tinet " + addr + " --> " + addr + " netmask 0xffffffff\n", ""
+	}
+	all := append([]*Network(nil), m.others...)
+	if m.primary != nil {
+		all = append(all, m.primary)
+	}
+	for _, n := range all {
+		if n.Service.Device == iface {
+			out := iface + ": flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+			if n.Address.IsValid() {
+				out += "\tinet " + n.Address.String() + " netmask 0xffffff00 broadcast 255.255.255.255\n"
+			}
+			return out + "\tstatus: active\n", ""
+		}
+	}
+	for _, svc := range m.services {
+		if svc.Device == iface {
+			return iface + ": flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500\n\tstatus: inactive\n", ""
+		}
+	}
+	return "", "ifconfig: interface " + iface + " does not exist\n"
 }

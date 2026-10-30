@@ -28,6 +28,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -134,6 +135,7 @@ type Session struct {
 	tun           TUN
 	stopTransport func()
 	current       sysrouter.DefaultRoute
+	currentAddrs  []netip.Addr
 	offline       bool
 	offlineSince  time.Time
 	// lastSeenDefaults is the default-route summary last logged while offline.
@@ -173,15 +175,20 @@ func Up(ctx context.Context, opts Options) (_ *Session, err error) {
 		return nil, fmt.Errorf("reading system resolvers: %w", err)
 	}
 	resolvers = appendUnique(resolvers, primary.Gateway)
+	addrs, err := r.InterfaceAddrs(ctx, primary.Interface)
+	if err != nil {
+		return nil, fmt.Errorf("reading the addresses of %s: %w", primary.Interface, err)
+	}
 	ipv6, err := r.IPv6(ctx, service)
 	if err != nil {
 		return nil, fmt.Errorf("reading IPv6 setting of %q: %w", service, err)
 	}
 
 	s := &Session{
-		opts:    opts,
-		log:     log,
-		current: primary,
+		opts:         opts,
+		log:          log,
+		current:      primary,
+		currentAddrs: addrs,
 		st: &state.State{
 			Version:         state.CurrentVersion,
 			PID:             os.Getpid(),
@@ -578,6 +585,14 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 		return err
 	}
 	primary, ok := sysrouter.PrimaryDefault(routes, s.st.UTun)
+	var addrs []netip.Addr
+	if ok {
+		// The interface must also have an address: routes added before it has
+		// one would capture no (or a stale) source address.
+		if addrs, err = r.InterfaceAddrs(ctx, primary.Interface); err != nil || len(addrs) == 0 {
+			ok = false
+		}
+	}
 	if !ok {
 		if !s.offline {
 			s.log.Warn("the network is gone; waiting for it to come back")
@@ -594,15 +609,24 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 		}
 		return nil
 	}
-	if s.offline {
+	cameBack := s.offline
+	if cameBack {
 		s.log.Info("the network is back", "after", time.Since(s.offlineSince).Round(time.Second).String(), "network", primary.String())
 	}
 	s.offline = false
 	s.lastSeenDefaults = ""
-	if primary == s.current {
+	// The Mac's own address is part of the network: macOS stores it in each
+	// gateway route when the route is added, and keeps using it after it is
+	// gone, which fails every connection with "can't assign requested
+	// address". So a new address (for example after rejoining the same router
+	// on another Wi-Fi band) needs the routes re-created, and so does any
+	// return from offline, since the interface address may have been replaced.
+	if !cameBack && primary == s.current && slices.Equal(addrs, s.currentAddrs) {
 		return nil
 	}
-	s.log.Info("the network changed", "from", s.current.String(), "to", primary.String())
+	s.log.Info("the network changed; re-creating the routes",
+		"from", s.current.String()+" as "+joinAddrs(s.currentAddrs),
+		"to", primary.String()+" as "+joinAddrs(addrs))
 
 	// Move the physical routes to the new network.
 	var kept []state.Route
@@ -644,6 +668,7 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 		return err
 	}
 	s.current = primary
+	s.currentAddrs = addrs
 	if err := r.FlushDNSCache(ctx); err != nil {
 		s.log.Warn("flushing the DNS cache failed", "err", err)
 	}
@@ -780,4 +805,15 @@ func describeDefaults(routes []sysrouter.DefaultRoute) string {
 		}
 	}
 	return strings.Join(parts, ", ")
+}
+
+func joinAddrs(addrs []netip.Addr) string {
+	if len(addrs) == 0 {
+		return "no address"
+	}
+	parts := make([]string, len(addrs))
+	for i, a := range addrs {
+		parts[i] = a.String()
+	}
+	return strings.Join(parts, ",")
 }

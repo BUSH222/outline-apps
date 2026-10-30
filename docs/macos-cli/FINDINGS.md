@@ -188,3 +188,23 @@ Verified so far:
 - The earlier run showed the same state for over 40 s. After Ctrl-C, which restores DNS and routes, the network works.
 - **Working hypothesis:** something in the connected state keeps macOS from finishing the new network's IPv4 setup (DHCP, or the default route).
 - **Added to find out:** while offline, the CLI now logs the default routes it sees (including scoped ones) each time they change, and how long it has been waiting.
+
+## 13. Manual test 5 (developer's Mac, 2026-10-30): switching between a router's 2.4 GHz and 5 GHz networks
+
+Baseline without the VPN: about 6 s to switch.
+
+**With the VPN:**
+- The CLI saw the drop and logged `the network is back after 4s`, with the same router (`192.168.1.254`) on the same interface (`en1`).
+- After that, every connection to the server failed with `can't assign requested address` for minutes, although `en1` was up (`BOUND`, `RouterARPVerified`) with a new address: `192.168.1.79` instead of `192.168.1.78`.
+
+**Cause:**
+- macOS stores the interface address in a gateway route when the route is added, and keeps using it after that address is gone.
+- The CLI's own gateway routes (the server host route and the exclusions, visible as `192.168/16` and `172.16/12` via `192.168.1.254`) still used `.78`.
+- The CLI decided "network changed" by interface and gateway only, so with the same router it never re-created them.
+- This most likely also explains the hotspot runs (manual tests 3 and 4), where the address changed as well.
+
+**Fix:**
+- The interface's IPv4 addresses (`ifconfig IFACE`, read-only) are now part of the network's identity.
+- Any change of interface, gateway or address, and any return from offline, deletes and re-adds the gateway routes, refreshes the direct resolvers, and notifies the transport.
+- A default route on an interface without an address counts as "not yet online".
+- The simulated Mac now models routes that keep their old source address, and tests reproduce the failure: same router with a new address, an address change without a gap, a return with the same address, and waiting for an address.

@@ -699,3 +699,96 @@ func TestNetworkChange_LogsWhatItSeesWhileOffline(t *testing.T) {
 	require.Contains(t, h.logs.String(), "the network changed")
 	require.NoError(t, s.Down(ctx))
 }
+
+// Reproduces manual test 5: switching between the 2.4 GHz and 5 GHz networks
+// of the same router keeps the interface and the gateway but gives the Mac a
+// new address. The CLI's gateway routes kept the old source address, so every
+// connection to the server failed with "can't assign requested address".
+func TestNetworkChange_NewAddressOnTheSameRouter(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+	require.Empty(t, h.mac.StaleRoutes())
+
+	h.mac.GoOffline()
+	require.NoError(t, s.CheckNetwork(ctx))
+	h.mac.SwitchTo(fakemac.WiFi)
+	h.mac.ChangeAddress(netip.MustParseAddr("192.168.1.79"))
+	require.NotEmpty(t, h.mac.StaleRoutes(), "the bug: routes still use 192.168.1.23")
+
+	n := len(h.exec.Calls())
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Empty(t, h.mac.StaleRoutes(), "every gateway route is re-created with the new address")
+	m := mutations(h.exec.Calls()[n:])
+	require.Contains(t, m, "route -n delete -host 100.200.0.10 192.168.1.1")
+	require.Contains(t, m, "route -n add -host 100.200.0.10 192.168.1.1")
+	require.Contains(t, h.logs.String(), "as 192.168.1.79")
+	require.Len(t, h.netChange, 2, "the transport is told about the change")
+
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+}
+
+// The address changing without the default route ever disappearing (a DHCP
+// renewal with a new lease) is caught too.
+func TestNetworkChange_AddressChangeWithoutAGap(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Len(t, h.netChange, 1, "nothing changed yet")
+
+	h.mac.ChangeAddress(netip.MustParseAddr("192.168.1.80"))
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Empty(t, h.mac.StaleRoutes())
+	require.Len(t, h.netChange, 2)
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+}
+
+// Coming back after a gap re-creates the routes even when nothing visible
+// changed, because macOS may have replaced the interface address.
+func TestNetworkChange_BackAfterAGapWithTheSameAddress(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+	h.mac.GoOffline()
+	require.NoError(t, s.CheckNetwork(ctx))
+	h.mac.SwitchTo(fakemac.WiFi)
+	n := len(h.exec.Calls())
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Contains(t, mutations(h.exec.Calls()[n:]), "route -n add -net 10.0.0.0/8 192.168.1.1")
+	require.Len(t, h.netChange, 2)
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+}
+
+// A default route on an interface that has no address yet is not a usable
+// network: routes added now would have no valid source address.
+func TestNetworkChange_WaitsForAnAddress(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+
+	noAddress := fakemac.Hotspot
+	noAddress.Address = netip.Addr{}
+	h.mac.SwitchTo(noAddress)
+	n := len(h.exec.Calls())
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Empty(t, mutations(h.exec.Calls()[n:]), "nothing is re-routed without an address")
+	require.Contains(t, h.logs.String(), "the network is gone")
+
+	h.mac.ChangeAddress(fakemac.Hotspot.Address)
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Empty(t, h.mac.StaleRoutes())
+	route, ok := h.mac.HasRoute("100.200.0.10/32")
+	require.True(t, ok)
+	require.Equal(t, "172.20.10.1", route.Gateway.String())
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+}

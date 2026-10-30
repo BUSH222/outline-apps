@@ -534,3 +534,24 @@ func TestRouter_LookupRouteEmptyOutputMeansAbsent(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, RouteAbsent, got)
 }
+
+func TestRouter_InterfaceAddrs(t *testing.T) {
+	// The format of `ifconfig en1` on macOS (MAC address and IPv6 are fake).
+	out := `en1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500
+	options=6460<TSO4,TSO6,CHANNEL_IO,PARTIAL_CSUM,ZEROINVERT_CSUM>
+	ether 02:00:00:00:00:04
+	inet6 fe80::1c2b:3a4d:5e6f:7081%en1 prefixlen 64 secured scopeid 0x6
+	inet 192.168.1.79 netmask 0xffffff00 broadcast 192.168.1.255
+	nd6 options=201<PERFORMNUD,DAD>
+	media: autoselect
+	status: active
+`
+	r, f := newRouter(func(sysexec.Call) ([]byte, error) { return []byte(out), nil })
+	addrs, err := r.InterfaceAddrs(context.Background(), "en1")
+	require.NoError(t, err)
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.168.1.79")}, addrs)
+	require.Equal(t, "ifconfig en1", f.Calls()[0].String())
+	require.True(t, IsReadOnly(f.Calls()[0]))
+	require.False(t, IsReadOnly(sysexec.Cmd("ifconfig", "-a")))
+	require.Nil(t, parseInetAddrs("en1: flags=8863<UP>\n\tstatus: inactive\n"))
+}

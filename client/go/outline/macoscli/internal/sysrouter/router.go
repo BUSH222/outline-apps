@@ -54,6 +54,7 @@ type SystemRouter interface {
 	DNSServers(ctx context.Context, service string) ([]string, error)
 	SystemResolvers(ctx context.Context, iface string) ([]netip.Addr, error)
 	DHCPResolvers(ctx context.Context, iface string) ([]netip.Addr, error)
+	InterfaceAddrs(ctx context.Context, iface string) ([]netip.Addr, error)
 	IPv6(ctx context.Context, service string) (IPv6Config, error)
 	ConfigureUTun(ctx context.Context, name string, local, peer netip.Addr) error
 	LookupRoute(ctx context.Context, dst netip.Prefix) (RouteStatus, error)
@@ -80,6 +81,9 @@ func IsReadOnly(c sysexec.Call) bool {
 		return true
 	case "ipconfig":
 		return len(c.Args) == 2 && c.Args[0] == "getpacket"
+	case "ifconfig":
+		// "ifconfig IFACE" only prints; anything more configures.
+		return len(c.Args) == 1 && !strings.HasPrefix(c.Args[0], "-")
 	case "scutil":
 		return len(c.Args) == 1 && c.Args[0] == "--dns"
 	case "route":
@@ -148,6 +152,16 @@ func (r *Router) DHCPResolvers(ctx context.Context, iface string) ([]netip.Addr,
 		return nil, nil
 	}
 	return parseDHCPResolvers(out), nil
+}
+
+// InterfaceAddrs returns the IPv4 addresses of an interface, in the order
+// ifconfig lists them.
+func (r *Router) InterfaceAddrs(ctx context.Context, iface string) ([]netip.Addr, error) {
+	out, err := r.run(ctx, "ifconfig", iface)
+	if err != nil {
+		return nil, err
+	}
+	return parseInetAddrs(out), nil
 }
 
 // IPv6 returns a service's IPv6 setting.
