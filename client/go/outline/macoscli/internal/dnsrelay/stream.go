@@ -23,8 +23,6 @@ import (
 	"sync"
 	"time"
 
-	"localhost/client/go/outline/macoscli/internal/rules"
-
 	"golang.getoutline.org/sdk/transport"
 )
 
@@ -33,8 +31,9 @@ type DialFunc func(ctx context.Context) (transport.StreamConn, error)
 
 // StreamConn returns the connection that an app's DNS-over-TCP connection to
 // local is relayed to. It reads the app's queries from the stream:
-//   - bypass queries go to the direct resolvers over TCP (or, if they fail,
-//     through the tunnel);
+//   - bypass queries go to the direct resolvers over TCP only; if they fail,
+//     the app gets "server failure";
+//   - queries mixing bypass and other names get "server failure" at once;
 //   - every other query goes through the tunnel, over one connection dialed
 //     with dialTunnel when the first such query arrives.
 //
@@ -86,13 +85,20 @@ func (c *streamConn) Write(p []byte) (int, error) {
 	}
 	msgs, err := c.framer.Push(p)
 	for _, q := range msgs {
-		if class, _ := c.relay.Classify(q); class == rules.Bypass {
+		switch action, _ := c.relay.Decide(q); action {
+		case ViaDirect:
 			c.pending.Add(1)
 			go c.resolveDirect(q)
-			continue
-		}
-		if err := c.sendTunnel(q); err != nil {
-			return 0, err
+		case Refuse:
+			c.pending.Add(1)
+			go func() {
+				defer c.pending.Done()
+				c.writeServFail(q)
+			}()
+		default:
+			if err := c.sendTunnel(q); err != nil {
+				return 0, err
+			}
 		}
 	}
 	if err != nil {
@@ -106,11 +112,18 @@ func (c *streamConn) resolveDirect(q []byte) {
 	reply, err := c.relay.ResolveDirect(c.ctx, q, true)
 	if err != nil {
 		if c.ctx.Err() == nil {
-			c.sendTunnel(q)
+			c.writeServFail(q)
 		}
 		return
 	}
 	c.writeReply(reply)
+}
+
+// writeServFail answers a query with "server failure".
+func (c *streamConn) writeServFail(q []byte) {
+	if reply := ServFail(q); reply != nil {
+		c.writeReply(reply)
+	}
 }
 
 // sendTunnel sends a query through the tunnel, dialing it on first use.
@@ -128,11 +141,6 @@ func (c *streamConn) sendTunnel(q []byte) error {
 	}
 	if _, err := c.inner.Write(frame(q)); err != nil {
 		return err
-	}
-	if c.writeClosed {
-		// A late query (a direct lookup that fell back): the app has already
-		// finished sending, so let the server finish too.
-		c.inner.CloseWrite()
 	}
 	return nil
 }

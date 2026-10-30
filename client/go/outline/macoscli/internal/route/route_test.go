@@ -461,16 +461,28 @@ func TestUDP_OtherDNSGoesThroughTheTunnelAndIsLearned(t *testing.T) {
 	require.NoError(t, <-done)
 }
 
-func TestUDP_DirectDNSFailureFallsBackToTheTunnel(t *testing.T) {
+func TestUDP_DirectDNSFailureFailsTheLookup(t *testing.T) {
 	f := newFixture(t)
 	f.directDNS.answer = func([]byte) ([]byte, error) { return nil, errors.New("no answer") }
-	s, _, _ := newAssoc(t, f)
+	s, h, done := newAssoc(t, f)
 	q := dnstest.Query(4, dnsmessage.TypeA, "lichess.org")
 	require.NoError(t, s.SendPacket(q, dnsAddr))
-	require.Eventually(t, func() bool { return f.tunnelUDP.count() == 1 }, 5*time.Second, time.Millisecond)
-	sent := recvSent(t, f.tunnelUDP.assoc(0))
-	require.Equal(t, q, sent.data)
-	require.Equal(t, dnsAddr, sent.addr)
+	reply := h.next(t)
+	require.Equal(t, dnsAddr, reply.addr)
+	require.Equal(t, uint16(4), dnstest.ID(reply.data))
+	require.Equal(t, byte(dnsmessage.RCodeServerFailure), reply.data[3]&0x0f)
+	require.NoError(t, <-done)
+	require.Zero(t, f.tunnelUDP.count(), "a bypass name is never looked up through the tunnel")
+}
+
+func TestUDP_MixedDNSQueryIsRefused(t *testing.T) {
+	f := newFixture(t)
+	s, h, _ := newAssoc(t, f)
+	require.NoError(t, s.SendPacket(dnstest.Query(5, dnsmessage.TypeA, "lichess.org", "example.com"), dnsAddr))
+	reply := h.next(t)
+	require.Equal(t, byte(dnsmessage.RCodeServerFailure), reply.data[3]&0x0f)
+	require.Zero(t, f.tunnelUDP.count())
+	require.Zero(t, f.directDNS.calls.Load())
 }
 
 func TestUDP_EndedSubAssociationIsReplaced(t *testing.T) {

@@ -18,8 +18,8 @@
 //
 //   - Queries for bypass names are answered by the network's own resolvers,
 //     over sockets bound to the physical interface, so content networks
-//     answer with servers near the user. If those resolvers fail, the query
-//     goes through the tunnel instead.
+//     answer with servers near the user. They never go through the tunnel: if
+//     those resolvers fail, the app gets "server failure".
 //   - Every other query goes through the tunnel unchanged.
 //   - Every answer is read on the way back, and the addresses of listed
 //     domains are remembered in an ipcache.Cache, which is how traffic to an
@@ -206,11 +206,11 @@ type Relay struct {
 	OnLearn func(addrs []netip.Addr)
 	Log     *slog.Logger
 
-	lastFallbackWarn atomic.Int64
+	lastFailureWarn atomic.Int64
 }
 
-// fallbackWarnInterval limits warnings about direct lookups that failed.
-const fallbackWarnInterval = 30 * time.Second
+// failureWarnInterval limits warnings about direct lookups that failed.
+const failureWarnInterval = 30 * time.Second
 
 func (r *Relay) log() *slog.Logger {
 	if r.Log == nil {
@@ -219,9 +219,9 @@ func (r *Relay) log() *slog.Logger {
 	return r.Log
 }
 
-// Classify returns the class of a query (see the package function).
-func (r *Relay) Classify(query []byte) (rules.Class, string) {
-	return Classify(query, r.Rules)
+// Decide returns where a query goes (see the package function).
+func (r *Relay) Decide(query []byte) (Action, string) {
+	return Decide(query, r.Rules)
 }
 
 // Learn records the listed domains' addresses from a DNS response, then
@@ -242,24 +242,27 @@ func (r *Relay) Learn(response []byte) {
 }
 
 // ResolveDirect sends a query to the direct resolvers and learns from the
-// answer. On failure the caller sends the query through the tunnel instead.
+// answer. On failure the caller answers the app with ServFail: a bypass name
+// never goes through the tunnel.
 func (r *Relay) ResolveDirect(ctx context.Context, query []byte, overTCP bool) ([]byte, error) {
 	reply, err := r.Direct.Exchange(ctx, query, overTCP)
 	if err != nil {
-		r.noteFallback(query, err)
+		r.noteFailure(query, err)
 		return nil, err
 	}
 	r.Learn(reply)
 	return reply, nil
 }
 
-func (r *Relay) noteFallback(query []byte, err error) {
-	_, name := r.Classify(query)
+const directFailureMsg = "the network's DNS didn't answer for a bypass name, so the lookup failed (bypass names are never looked up through the VPN)"
+
+func (r *Relay) noteFailure(query []byte, err error) {
+	_, name := r.Decide(query)
 	now := time.Now().UnixNano()
-	last := r.lastFallbackWarn.Load()
-	if now-last >= int64(fallbackWarnInterval) && r.lastFallbackWarn.CompareAndSwap(last, now) {
-		r.log().Warn("the network's DNS didn't answer for a bypass name; asking through the tunnel instead", "name", name, "err", err)
+	last := r.lastFailureWarn.Load()
+	if now-last >= int64(failureWarnInterval) && r.lastFailureWarn.CompareAndSwap(last, now) {
+		r.log().Warn(directFailureMsg, "name", name, "err", err)
 		return
 	}
-	r.log().Debug("the network's DNS didn't answer for a bypass name; asking through the tunnel instead", "name", name, "err", err)
+	r.log().Debug(directFailureMsg, "name", name, "err", err)
 }

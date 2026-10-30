@@ -17,6 +17,7 @@ package dnsrelay
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/netip"
@@ -56,29 +57,47 @@ func lookup(r *Relay, addr string) rules.Class {
 	return c
 }
 
-func TestClassify(t *testing.T) {
+func TestDecide(t *testing.T) {
 	r, err := rules.Parse([]byte(testRules))
 	require.NoError(t, err)
 	a := dnsmessage.TypeA
 	for name, tc := range map[string]struct {
 		msg  []byte
-		want rules.Class
+		want Action
 	}{
-		"bypass":                {dnstest.Query(1, a, "www.lichess.org"), rules.Bypass},
-		"bypass AAAA":           {dnstest.Query(1, dnsmessage.TypeAAAA, "lichess.org"), rules.Bypass},
-		"not a label boundary":  {dnstest.Query(1, a, "notlichess.org"), rules.None},
-		"vpn_only":              {dnstest.Query(1, a, "a.secret.example"), rules.VPNOnly},
-		"unlisted":              {dnstest.Query(1, a, "example.com"), rules.None},
-		"all bypass":            {dnstest.Query(1, a, "lichess.org", "cdn.example"), rules.Bypass},
-		"mixed goes the tunnel": {dnstest.Query(1, a, "lichess.org", "example.com"), rules.None},
-		"any vpn_only wins":     {dnstest.Query(1, a, "lichess.org", "secret.example"), rules.VPNOnly},
-		"a response":            {dnstest.Response(1, "lichess.org", dnstest.Options{}), rules.None},
-		"malformed":             {[]byte{0, 1, 2}, rules.None},
-		"empty":                 {nil, rules.None},
+		"bypass":                     {dnstest.Query(1, a, "www.lichess.org"), ViaDirect},
+		"bypass AAAA":                {dnstest.Query(1, dnsmessage.TypeAAAA, "lichess.org"), ViaDirect},
+		"not a label boundary":       {dnstest.Query(1, a, "notlichess.org"), ViaTunnel},
+		"vpn_only":                   {dnstest.Query(1, a, "a.secret.example"), ViaTunnel},
+		"unlisted":                   {dnstest.Query(1, a, "example.com"), ViaTunnel},
+		"all bypass":                 {dnstest.Query(1, a, "lichess.org", "cdn.example"), ViaDirect},
+		"bypass mixed with unlisted": {dnstest.Query(1, a, "lichess.org", "example.com"), Refuse},
+		"bypass mixed with vpn_only": {dnstest.Query(1, a, "lichess.org", "secret.example"), Refuse},
+		"vpn_only and unlisted":      {dnstest.Query(1, a, "secret.example", "example.com"), ViaTunnel},
+		"a response":                 {dnstest.Response(1, "lichess.org", dnstest.Options{}), ViaTunnel},
+		"malformed":                  {[]byte{0, 1, 2}, ViaTunnel},
+		"empty":                      {nil, ViaTunnel},
 	} {
-		got, _ := Classify(tc.msg, r)
+		got, _ := Decide(tc.msg, r)
 		require.Equal(t, tc.want, got, name)
 	}
+}
+
+func TestServFail(t *testing.T) {
+	q := dnstest.Query(42, dnsmessage.TypeAAAA, "lichess.org")
+	reply := ServFail(q)
+	var p dnsmessage.Parser
+	h, err := p.Start(reply)
+	require.NoError(t, err)
+	require.Equal(t, uint16(42), h.ID)
+	require.True(t, h.Response)
+	require.True(t, h.RecursionDesired)
+	require.Equal(t, dnsmessage.RCodeServerFailure, h.RCode)
+	question, err := p.Question()
+	require.NoError(t, err)
+	require.Equal(t, "lichess.org.", question.Name.String())
+	require.Equal(t, dnsmessage.TypeAAAA, question.Type)
+	require.Nil(t, ServFail([]byte{1, 2, 3}))
 }
 
 func TestSnoop(t *testing.T) {
@@ -460,14 +479,19 @@ func TestStreamConn_SplitsQueriesBetweenDirectAndTunnel(t *testing.T) {
 	require.NoError(t, conn.Close())
 }
 
-func TestStreamConn_DirectFailureFallsBackToTheTunnel(t *testing.T) {
+// tunnelMustNotBeUsed fails the test if anything dials the tunnel.
+func tunnelMustNotBeUsed(t *testing.T) DialFunc {
+	return func(context.Context) (transport.StreamConn, error) {
+		t.Error("a bypass name must never be looked up through the tunnel")
+		return nil, errors.New("no")
+	}
+}
+
+func TestStreamConn_DirectFailureFailsTheLookup(t *testing.T) {
 	r := testRelay(t, &fakeExchanger{answer: func([]byte, bool) ([]byte, error) {
 		return nil, errors.New("network DNS unreachable")
 	}})
-	tun := &tunnelDNS{queries: make(chan string, 10), answer: func(q []byte) []byte {
-		return dnstest.ReplyTo(q, dnstest.Options{}, dnstest.RR{Name: "lichess.org", Addr: "203.0.113.1", TTL: 60})
-	}}
-	conn := r.StreamConn(dnsAddr, tun.dial)
+	conn := r.StreamConn(dnsAddr, tunnelMustNotBeUsed(t))
 	done := make(chan map[string][]byte)
 	go func() { done <- readReplies(t, conn) }()
 	_, err := conn.Write(dnstest.Frame(dnstest.Query(1, dnsmessage.TypeA, "lichess.org")))
@@ -475,9 +499,23 @@ func TestStreamConn_DirectFailureFallsBackToTheTunnel(t *testing.T) {
 	require.NoError(t, conn.CloseWrite())
 	replies := <-done
 	require.Contains(t, replies, "lichess.org")
-	require.Equal(t, "lichess.org", <-tun.queries)
-	// The answer still names a bypass domain, so its address goes direct.
-	require.Equal(t, rules.Bypass, lookup(r, "203.0.113.1"))
+	require.Equal(t, dnsmessage.RCodeServerFailure, rcode(replies["lichess.org"]))
+	require.Equal(t, uint16(1), dnstest.ID(replies["lichess.org"]))
+}
+
+func TestStreamConn_MixedQueryIsRefused(t *testing.T) {
+	direct := &fakeExchanger{answer: func([]byte, bool) ([]byte, error) {
+		t.Error("a mixed query must not go direct either")
+		return nil, errors.New("no")
+	}}
+	conn := testRelay(t, direct).StreamConn(dnsAddr, tunnelMustNotBeUsed(t))
+	done := make(chan map[string][]byte)
+	go func() { done <- readReplies(t, conn) }()
+	_, err := conn.Write(dnstest.Frame(dnstest.Query(7, dnsmessage.TypeA, "lichess.org", "example.com")))
+	require.NoError(t, err)
+	require.NoError(t, conn.CloseWrite())
+	replies := <-done
+	require.Equal(t, dnsmessage.RCodeServerFailure, rcode(replies["lichess.org"]))
 }
 
 func TestStreamConn_TunnelDialFailureFailsTheWrite(t *testing.T) {
@@ -541,19 +579,89 @@ func TestPrefetch_RefreshesAt80PercentOfTheTTL(t *testing.T) {
 	})
 }
 
-func TestPrefetch_RetriesFailures(t *testing.T) {
+func TestPrefetch_FailuresBackOff(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {
 		direct := &fakeExchanger{answer: func([]byte, bool) ([]byte, error) {
 			return nil, errors.New("no answer")
 		}}
 		r := testRelay(t, direct)
 		ctx, cancel := context.WithCancel(context.Background())
-		go r.Prefetch(ctx, []string{"lichess.org", "cdn.example"})
+		go r.Prefetch(ctx, []string{"lichess.org"})
 		synctest.Wait()
-		require.Equal(t, int32(2), direct.calls.Load())
-		time.Sleep(prefetchRetry)
+		require.Equal(t, int32(1), direct.calls.Load())
+		// Retries after 1, 2, 4, 8, 16 and 32 minutes, then every hour (max_ttl).
+		for i, wait := range []time.Duration{1, 2, 4, 8, 16, 32, 60, 60} {
+			time.Sleep(wait*time.Minute - time.Second)
+			synctest.Wait()
+			require.Equal(t, int32(i+1), direct.calls.Load(), "not yet, before retry %d", i+1)
+			time.Sleep(time.Second)
+			synctest.Wait()
+			require.Equal(t, int32(i+2), direct.calls.Load(), "retry %d", i+1)
+		}
+		cancel()
+		synctest.Wait()
+	})
+}
+
+func TestPrefetch_SuccessResetsTheBackOff(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var fail atomic.Bool
+		fail.Store(true)
+		direct := &fakeExchanger{answer: func(q []byte, _ bool) ([]byte, error) {
+			if fail.Load() {
+				return nil, errors.New("no answer")
+			}
+			return dnstest.ReplyTo(q, dnstest.Options{}, dnstest.RR{Name: "lichess.org", Addr: "192.0.2.1", TTL: 300}), nil
+		}}
+		r := testRelay(t, direct)
+		ctx, cancel := context.WithCancel(context.Background())
+		go r.Prefetch(ctx, []string{"lichess.org"})
+		synctest.Wait()
+		time.Sleep(time.Minute) // first retry: 1 min
+		synctest.Wait()
+		fail.Store(false)
+		time.Sleep(2 * time.Minute) // second retry (2 min) succeeds
+		synctest.Wait()
+		require.Equal(t, int32(3), direct.calls.Load())
+		require.Equal(t, rules.Bypass, lookup(r, "192.0.2.1"))
+		fail.Store(true)
+		time.Sleep(240 * time.Second) // refresh at 80% of 300 s fails
 		synctest.Wait()
 		require.Equal(t, int32(4), direct.calls.Load())
+		time.Sleep(time.Minute) // and the back-off starts again at 1 min
+		synctest.Wait()
+		require.Equal(t, int32(5), direct.calls.Load())
+		cancel()
+		synctest.Wait()
+	})
+}
+
+func TestPrefetch_AtMostFourLookupsAtOnce(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		var inFlight, most atomic.Int32
+		direct := &fakeExchanger{answer: func(q []byte, _ bool) ([]byte, error) {
+			n := inFlight.Add(1)
+			defer inFlight.Add(-1)
+			for {
+				m := most.Load()
+				if n <= m || most.CompareAndSwap(m, n) {
+					break
+				}
+			}
+			time.Sleep(time.Second) // a slow router
+			return dnstest.ReplyTo(q, dnstest.Options{}, dnstest.RR{Name: dnstest.QuestionName(q), Addr: "192.0.2.1", TTL: 600}), nil
+		}}
+		r := testRelay(t, direct)
+		var names []string
+		for i := range 20 {
+			names = append(names, fmt.Sprintf("n%d.lichess.org", i))
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		go r.Prefetch(ctx, names)
+		time.Sleep(10 * time.Second)
+		synctest.Wait()
+		require.Equal(t, int32(20), direct.calls.Load(), "all looked up, in 5 rounds")
+		require.Equal(t, int32(prefetchParallel), most.Load())
 		cancel()
 		synctest.Wait()
 	})

@@ -17,6 +17,7 @@ package dnsrelay
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"net/netip"
 	"time"
@@ -29,31 +30,97 @@ import (
 // maxChain bounds how many CNAME records are followed.
 const maxChain = 16
 
-// Classify returns the class of a DNS query from its question names: Bypass
-// only if every question is a bypass name, VPNOnly if any is a vpn_only name,
-// None otherwise. It also returns the first question name, for logs.
-// A message that can't be parsed, or isn't a plain query, is None, so it goes
-// through the tunnel untouched.
-func Classify(query []byte, r *rules.Rules) (rules.Class, string) {
+// Action says where a DNS query goes.
+type Action int
+
+const (
+	// ViaTunnel: through the tunnel, unchanged.
+	ViaTunnel Action = iota
+	// ViaDirect: to the network's own resolvers only. A bypass name is never
+	// looked up through the tunnel; if the network's resolvers fail, the
+	// lookup fails.
+	ViaDirect
+	// Refuse: answered "server failure" locally. A query that asks for bypass
+	// names together with other names can't go either way without sending a
+	// bypass name through the tunnel or another name outside it.
+	Refuse
+)
+
+func (a Action) String() string {
+	switch a {
+	case ViaTunnel:
+		return "tunnel"
+	case ViaDirect:
+		return "direct"
+	case Refuse:
+		return "refuse"
+	default:
+		return fmt.Sprintf("Action(%d)", int(a))
+	}
+}
+
+// Decide returns where a DNS query goes, from its question names: ViaDirect
+// if every question is a bypass name, ViaTunnel if none is (vpn_only names
+// included), Refuse if some are. It also returns the first question name, for
+// logs. A message that can't be parsed, or isn't a plain query, goes through
+// the tunnel untouched (no bypass name can be read from it).
+func Decide(query []byte, r *rules.Rules) (Action, string) {
 	var p dnsmessage.Parser
 	h, err := p.Start(query)
 	if err != nil || h.Response || h.OpCode != 0 {
-		return rules.None, ""
+		return ViaTunnel, ""
 	}
 	qs, err := p.AllQuestions()
 	if err != nil || len(qs) == 0 {
-		return rules.None, ""
+		return ViaTunnel, ""
 	}
-	all := rules.Bypass
+	bypass := 0
 	for _, q := range qs {
-		switch c, _ := r.Match(q.Name.String()); c {
-		case rules.VPNOnly:
-			return rules.VPNOnly, rules.Normalize(qs[0].Name.String())
-		case rules.None:
-			all = rules.None
+		if c, _ := r.Match(q.Name.String()); c == rules.Bypass {
+			bypass++
 		}
 	}
-	return all, rules.Normalize(qs[0].Name.String())
+	name := rules.Normalize(qs[0].Name.String())
+	switch bypass {
+	case 0:
+		return ViaTunnel, name
+	case len(qs):
+		return ViaDirect, name
+	default:
+		return Refuse, name
+	}
+}
+
+// ServFail builds a "server failure" response to query, or nil if query
+// can't be parsed.
+func ServFail(query []byte) []byte {
+	var p dnsmessage.Parser
+	h, err := p.Start(query)
+	if err != nil {
+		return nil
+	}
+	qs, err := p.AllQuestions()
+	if err != nil {
+		return nil
+	}
+	b := dnsmessage.NewBuilder(nil, dnsmessage.Header{
+		ID: h.ID, Response: true, OpCode: h.OpCode,
+		RecursionDesired: h.RecursionDesired, RecursionAvailable: true,
+		RCode: dnsmessage.RCodeServerFailure,
+	})
+	if err := b.StartQuestions(); err != nil {
+		return nil
+	}
+	for _, q := range qs {
+		if err := b.Question(q); err != nil {
+			return nil
+		}
+	}
+	msg, err := b.Finish()
+	if err != nil {
+		return nil
+	}
+	return msg
 }
 
 // Learned is an address that a DNS answer ties to a listed domain.

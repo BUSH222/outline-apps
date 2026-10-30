@@ -177,7 +177,7 @@ func TestBindFailureFailsTheDial(t *testing.T) {
 
 func TestSetResolvers(t *testing.T) {
 	b, _ := recordingBinder()
-	require.Equal(t, []netip.AddrPort{FallbackResolver}, b.Resolvers(), "default before capture")
+	require.Empty(t, b.Resolvers(), "none before capture")
 	b.SetResolvers([]netip.Addr{
 		netip.MustParseAddr("fe80::1%en0"),
 		netip.MustParseAddr("192.168.1.254"),
@@ -187,10 +187,9 @@ func TestSetResolvers(t *testing.T) {
 	require.Equal(t, []netip.AddrPort{
 		netip.MustParseAddrPort("192.168.1.254:53"),
 		netip.MustParseAddrPort("10.0.0.53:53"),
-		FallbackResolver,
-	}, b.Resolvers(), "IPv4 only, deduplicated, public fallback last")
+	}, b.Resolvers(), "IPv4 only, deduplicated, no public fallback")
 	b.SetResolvers([]netip.Addr{netip.MustParseAddr("2001:db8::53")})
-	require.Equal(t, []netip.AddrPort{FallbackResolver}, b.Resolvers())
+	require.Empty(t, b.Resolvers())
 }
 
 // fakeDNS answers every A query with answer, on loopback UDP.
@@ -361,4 +360,13 @@ func TestStreamDialerFallsBackToKnownAddresses(t *testing.T) {
 	// Other names don't get the server's addresses.
 	_, err = b.StreamDialer().DialStream(ctx(t), net.JoinHostPort("other.example.test", port))
 	require.ErrorContains(t, err, "resolving other.example.test")
+}
+
+func TestLookupIPv4WithoutResolvers(t *testing.T) {
+	b, _ := recordingBinder()
+	require.NoError(t, b.SetInterface("en0"))
+	_, err := b.LookupIPv4(ctx(t), "server.example.test")
+	require.ErrorContains(t, err, "no DNS server")
+	_, err = b.StreamDialer().DialStream(ctx(t), "server.example.test:443")
+	require.ErrorContains(t, err, "no DNS server")
 }

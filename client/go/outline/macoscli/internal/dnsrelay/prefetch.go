@@ -23,8 +23,14 @@ import (
 	"golang.org/x/net/dns/dnsmessage"
 )
 
-// prefetchRetry is how long to wait after a lookup that gave no address.
-const prefetchRetry = 30 * time.Second
+// prefetchFirstRetry is the wait after a first failed lookup. It doubles
+// after each further failure (1, 2, 4, ... minutes) up to max_ttl.
+const prefetchFirstRetry = time.Minute
+
+// prefetchParallel bounds the lookups in flight at once. Home routers drop
+// bursts: twenty lookups at once all timed out, while the same names asked
+// one at a time were answered in milliseconds (FINDINGS 24).
+const prefetchParallel = 4
 
 // refreshAt is the share of the TTL after which a name is looked up again.
 const refreshAt = 0.8
@@ -37,26 +43,46 @@ func (r *Relay) Prefetch(ctx context.Context, names []string) {
 }
 
 // PrefetchVia is Prefetch through a given exchanger (such as the tunnel) and
-// for the given record types. An answer without addresses is asked again
-// after the longest TTL; a failure after 30 s.
+// for the given record types, with at most prefetchParallel lookups at once.
+// An answer without addresses is asked again after max_ttl. A failure is
+// retried after 1 minute, then 2, 4, 8, ... up to max_ttl; a success resets
+// that.
 func (r *Relay) PrefetchVia(ctx context.Context, names []string, ex Exchanger, qtypes ...dnsmessage.Type) {
+	slots := make(chan struct{}, prefetchParallel)
 	var wg sync.WaitGroup
 	for _, name := range names {
 		for _, qtype := range qtypes {
-			wg.Go(func() { r.prefetchLoop(ctx, ex, name, qtype) })
+			wg.Go(func() { r.prefetchLoop(ctx, ex, slots, name, qtype) })
 		}
 	}
 	wg.Wait()
 }
 
-func (r *Relay) prefetchLoop(ctx context.Context, ex Exchanger, name string, qtype dnsmessage.Type) {
+func (r *Relay) prefetchLoop(ctx context.Context, ex Exchanger, slots chan struct{}, name string, qtype dnsmessage.Type) {
+	maxWait := r.Cache.Clamp(time.Duration(1 << 62))
+	failures := 0
 	for {
-		wait := prefetchRetry
-		switch ttl, found, answered := r.prefetchOnce(ctx, ex, name, qtype); {
+		select {
+		case slots <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
+		ttl, found, answered := r.prefetchOnce(ctx, ex, name, qtype)
+		<-slots
+		var wait time.Duration
+		switch {
 		case found:
+			failures = 0
 			wait = time.Duration(float64(r.Cache.Clamp(ttl)) * refreshAt)
 		case answered:
-			wait = r.Cache.Clamp(time.Duration(1 << 62))
+			failures = 0
+			wait = maxWait
+		default:
+			wait = maxWait
+			if failures < 30 {
+				wait = min(prefetchFirstRetry<<failures, maxWait)
+			}
+			failures++
 		}
 		t := time.NewTimer(wait)
 		select {

@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"sync"
 
+	"localhost/client/go/outline/macoscli/internal/dnsrelay"
 	"localhost/client/go/outline/macoscli/internal/rules"
 
 	"golang.getoutline.org/sdk/network/packetrelay"
@@ -30,7 +31,8 @@ import (
 // socket) by destination. Modeled on the SDK's dnsintercept association:
 //   - sub-associations on the tunnel and on the direct relay are created
 //     when first needed, and re-created if they end;
-//   - a bypass DNS query is resolved directly in its own goroutine;
+//   - a bypass DNS query is resolved directly in its own goroutine, and never
+//     through the tunnel (a failure is answered with "server failure");
 //   - the association closes itself once nothing is active any more (its
 //     sub-associations ended and no query is in flight), which lets lwIP
 //     release the app's socket, as upstream does.
@@ -75,10 +77,14 @@ type assoc struct {
 
 func (a *assoc) send(p []byte, dst netip.AddrPort) error {
 	if a.r.isDNS(dst) {
-		if class, _ := a.r.cfg.DNS.Classify(p); class == rules.Bypass {
+		switch action, _ := a.r.cfg.DNS.Decide(p); action {
+		case dnsrelay.ViaDirect:
 			return a.resolveDirect(p)
+		case dnsrelay.Refuse:
+			return a.answerLocally(dnsrelay.ServFail(p))
+		default:
+			return a.sendVia(subTunnel, p, dst)
 		}
-		return a.sendVia(subTunnel, p, dst)
 	}
 	if class, domain := a.r.classify(dst.Addr()); class == rules.Bypass {
 		a.r.log.Debug("bypass: UDP goes directly", "domain", domain, "to", dst.String())
@@ -157,8 +163,36 @@ func (a *assoc) receive(kind subKind, s packetrelay.PacketSender, recv packetrel
 }
 
 // resolveDirect answers a bypass query from the direct resolvers. If they
-// fail, the query goes through the tunnel instead.
+// fail, the app gets "server failure": a bypass name never goes through the
+// tunnel.
 func (a *assoc) resolveDirect(p []byte) error {
+	query := bytes.Clone(p)
+	return a.inBackground(func() {
+		reply, err := a.r.cfg.DNS.ResolveDirect(a.ctx, query, false)
+		if err != nil {
+			if a.ctx.Err() == nil {
+				if reply := dnsrelay.ServFail(query); reply != nil {
+					a.deliver(reply, a.r.cfg.DNSAddr)
+				}
+			}
+			return
+		}
+		// A truncated reply is passed on as is; the app retries over TCP.
+		a.deliver(reply, a.r.cfg.DNSAddr)
+	})
+}
+
+// answerLocally delivers a reply from the DNS address without asking anyone.
+func (a *assoc) answerLocally(reply []byte) error {
+	if reply == nil {
+		return nil
+	}
+	return a.inBackground(func() { a.deliver(reply, a.r.cfg.DNSAddr) })
+}
+
+// inBackground runs f in a goroutine that counts as activity, so the
+// association stays open until f is done.
+func (a *assoc) inBackground(f func()) error {
 	a.mu.Lock()
 	if a.isClosed {
 		a.mu.Unlock()
@@ -166,19 +200,9 @@ func (a *assoc) resolveDirect(p []byte) error {
 	}
 	a.active++
 	a.mu.Unlock()
-
-	query := bytes.Clone(p)
 	go func() {
 		defer a.release()
-		reply, err := a.r.cfg.DNS.ResolveDirect(a.ctx, query, false)
-		if err != nil {
-			if a.ctx.Err() == nil {
-				a.sendVia(subTunnel, query, a.r.cfg.DNSAddr)
-			}
-			return
-		}
-		// A truncated reply is passed on as is; the app retries over TCP.
-		a.deliver(reply, a.r.cfg.DNSAddr)
+		f()
 	}()
 	return nil
 }

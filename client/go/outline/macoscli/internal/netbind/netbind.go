@@ -39,10 +39,6 @@ import (
 // ErrNotBound is returned when a socket is requested before an interface is set.
 var ErrNotBound = errors.New("no physical interface to bind to yet")
 
-// FallbackResolver is used for direct lookups when no system resolver was
-// captured (decision D2).
-var FallbackResolver = netip.MustParseAddrPort("1.1.1.1:53")
-
 // resolverTimeout bounds one lookup on one resolver, so a dead resolver (for
 // example the previous network's router) is skipped quickly.
 const resolverTimeout = 3 * time.Second
@@ -141,8 +137,12 @@ func (b *Binder) Interface() (string, int) {
 }
 
 // SetResolvers sets the resolvers for direct lookups, tried in order. Only
-// IPv4 addresses are kept (IPv6 is off during a session), and
-// FallbackResolver is always tried last.
+// IPv4 addresses are kept (IPv6 is off during a session).
+//
+// There is no public fallback resolver: a bound socket can't reach an address
+// without a route on the physical interface (FINDINGS 16), so one like
+// 1.1.1.1 never answers. The network's own resolvers (its DHCP servers, the
+// gateway) are inside the excluded local ranges, which are routed.
 func (b *Binder) SetResolvers(addrs []netip.Addr) {
 	var servers []netip.AddrPort
 	add := func(s netip.AddrPort) {
@@ -158,7 +158,6 @@ func (b *Binder) SetResolvers(addrs []netip.Addr) {
 			add(netip.AddrPortFrom(a, 53))
 		}
 	}
-	add(FallbackResolver)
 	b.resolvers.Store(&servers)
 }
 
@@ -167,7 +166,7 @@ func (b *Binder) Resolvers() []netip.AddrPort {
 	if r := b.resolvers.Load(); r != nil {
 		return *r
 	}
-	return []netip.AddrPort{FallbackResolver}
+	return nil
 }
 
 // SetKnownAddrs sets addresses for host names (the server's, resolved when
@@ -294,8 +293,12 @@ func (b *Binder) LookupIPv4(ctx context.Context, host string) ([]netip.Addr, err
 	if b.ifIndex.Load() <= 0 {
 		return nil, ErrNotBound
 	}
+	servers := b.Resolvers()
+	if len(servers) == 0 {
+		return nil, errors.New("the network has no DNS server for direct lookups")
+	}
 	var errs []error
-	for _, server := range b.Resolvers() {
+	for _, server := range servers {
 		addrs, err := b.lookupWith(ctx, server, host)
 		if err == nil && len(addrs) > 0 {
 			return addrs, nil
