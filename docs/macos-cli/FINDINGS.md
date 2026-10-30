@@ -208,3 +208,7 @@ Baseline without the VPN: about 6 s to switch.
 - Any change of interface, gateway or address, and any return from offline, deletes and re-adds the gateway routes, refreshes the direct resolvers, and notifies the transport.
 - A default route on an interface without an address counts as "not yet online".
 - The simulated Mac now models routes that keep their old source address, and tests reproduce the failure: same router with a new address, an address change without a gap, a return with the same address, and waiting for an address.
+
+## 14. Manual test 6 (developer's Mac, 2026-10-30): network switch recovers
+
+With commit `67f98f82`, switching between the router's 2.4 GHz and 5 GHz networks while connected recovers: the routes are re-created with the new address, and traffic flows through the tunnel again. **M3 is confirmed on the developer's Mac** for connect, checks, disconnect, crash recovery, an IPv6 leak check and a same-router network switch. A hotspot switch (different router) has not been re-run since the fix.
