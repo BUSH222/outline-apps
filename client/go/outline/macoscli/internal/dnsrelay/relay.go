@@ -34,6 +34,7 @@ import (
 	"log/slog"
 	"net"
 	"net/netip"
+	"slices"
 	"sync/atomic"
 	"time"
 
@@ -162,7 +163,12 @@ type Relay struct {
 	Cache *ipcache.Cache
 	// Direct resolves bypass names without the tunnel.
 	Direct Exchanger
-	Log    *slog.Logger
+	// OnLearn, if set, is called with the addresses each answer taught,
+	// after the cache is updated and before the answer is passed on to the
+	// app. So a route it adds for an address exists by the time the app
+	// connects to it.
+	OnLearn func(addrs []netip.Addr)
+	Log     *slog.Logger
 
 	lastFallbackWarn atomic.Int64
 }
@@ -182,12 +188,20 @@ func (r *Relay) Classify(query []byte) (rules.Class, string) {
 	return Classify(query, r.Rules)
 }
 
-// Learn records the listed domains' addresses from a DNS response.
+// Learn records the listed domains' addresses from a DNS response, then
+// calls OnLearn.
 func (r *Relay) Learn(response []byte) {
+	var addrs []netip.Addr
 	for _, l := range Snoop(response, r.Rules) {
 		r.Cache.Learn(l.Addr, l.Class, l.Domain, l.TTL)
 		r.log().Debug("learned an address", "domain", l.Domain, "addr", l.Addr.String(), "class", l.Class.String(),
 			"ttl", r.Cache.Clamp(l.TTL).String())
+		if !slices.Contains(addrs, l.Addr) {
+			addrs = append(addrs, l.Addr)
+		}
+	}
+	if r.OnLearn != nil && len(addrs) > 0 {
+		r.OnLearn(addrs)
 	}
 }
 

@@ -87,6 +87,16 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 			return err
 		}
 	}
+	// live is the session once it is up. Bypass addresses learned from DNS
+	// get host routes via the physical gateway through it.
+	var live atomic.Pointer[tunnel.Session]
+	if dnsRelay != nil {
+		dnsRelay.OnLearn = func(addrs []netip.Addr) {
+			if s := live.Load(); s != nil {
+				syncDirectRoutes(s, dnsRelay.Cache, addrs, log)
+			}
+		}
+	}
 	var transportStarted atomic.Bool
 	notify := func() {
 		if pair.PacketRelay.NotifyNetworkChanged != nil {
@@ -119,7 +129,7 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 			}
 			return nil
 		},
-		Verify: e.verify(verifyInput{pair: pair, direct: binder.StreamDialer(), firstHops: hops, log: log}),
+		Verify: e.verify(verifyInput{pair: pair, log: log}),
 		Logger: log,
 	}
 	binder.SetLogger(log)
@@ -128,6 +138,7 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 	if err != nil {
 		return err
 	}
+	live.Store(session)
 	name, _ := binder.Interface()
 	fmt.Fprintf(e.stdout, "connected: traffic goes through the tunnel (bound to %s). Press Ctrl-C to disconnect.\n", name)
 
@@ -194,6 +205,39 @@ func newDomainRouting(pair *configregistry.TransportPair, binder *netbind.Binder
 	})
 	log.Info("domain rules are on", "bypass", len(r.Bypass), "vpn_only", len(r.VPNOnly))
 	return router.Pair(), relay, nil
+}
+
+// directRouteTimeout bounds the route changes for one DNS answer.
+const directRouteTimeout = 10 * time.Second
+
+// directRouter adds and removes host routes around the tunnel.
+type directRouter interface {
+	RouteDirect(ctx context.Context, addr netip.Addr) error
+	UnrouteDirect(ctx context.Context, addr netip.Addr) error
+}
+
+// syncDirectRoutes gives the addresses an answer taught a host route via the
+// physical gateway if they belong to a bypass domain, and takes it away
+// otherwise (an address also learned for a vpn_only domain must go through
+// the tunnel). Binding sockets alone doesn't get past the utun's routes on
+// macOS (manual test 7), and with the route, apps' own connections to the
+// address skip the tunnel too.
+func syncDirectRoutes(r directRouter, cache *ipcache.Cache, addrs []netip.Addr, log *slog.Logger) {
+	ctx, cancel := context.WithTimeout(context.Background(), directRouteTimeout)
+	defer cancel()
+	for _, a := range addrs {
+		class, domain := cache.Lookup(a)
+		var err error
+		if class == rules.Bypass {
+			err = r.RouteDirect(ctx, a)
+		} else {
+			err = r.UnrouteDirect(ctx, a)
+		}
+		if err != nil {
+			log.Warn("updating the direct route of an address failed; its traffic may not bypass the VPN",
+				"addr", a.String(), "domain", domain, "class", class.String(), "err", err)
+		}
+	}
 }
 
 // startRemoteDevice connects the lwIP stack to the transport, waits for the

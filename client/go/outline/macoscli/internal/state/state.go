@@ -43,7 +43,7 @@ const (
 // Route is a route the CLI added (or is about to add).
 type Route struct {
 	sysrouter.RouteSpec
-	// Purpose says why the route exists: "exclude", "first-hop", "dns" or "default".
+	// Purpose says why the route exists: "exclude", "first-hop", "bypass", "dns" or "default".
 	Purpose string `json:"purpose"`
 }
 

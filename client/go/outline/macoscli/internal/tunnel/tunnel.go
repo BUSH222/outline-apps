@@ -141,6 +141,8 @@ type Session struct {
 	// lastSeenDefaults is the default-route summary last logged while offline.
 	lastSeenDefaults string
 	closed           bool
+	// direct holds the addresses that RouteDirect routes around the tunnel.
+	direct map[netip.Addr]bool
 }
 
 // Up captures the current network settings, opens and configures the utun,
@@ -307,21 +309,12 @@ func (s *Session) planRoutes(primary sysrouter.DefaultRoute) []state.Route {
 }
 
 // physicalRoutes are the routes that go via the physical network: the
-// exclusions and the first-hop host routes.
+// exclusions, the first-hop host routes and the bypass host routes.
 func (s *Session) physicalRoutes(primary sysrouter.DefaultRoute) []state.Route {
-	via := func(dst netip.Prefix, purpose string) state.Route {
-		spec := sysrouter.RouteSpec{Dst: dst}
-		if primary.Gateway.IsValid() {
-			spec.Gateway = primary.Gateway
-		} else {
-			spec.Interface = primary.Interface
-		}
-		return state.Route{RouteSpec: spec, Purpose: purpose}
-	}
 	excluded := s.excluded()
 	var routes []state.Route
 	for _, p := range excluded {
-		routes = append(routes, via(p, PurposeExclude))
+		routes = append(routes, s.via(primary, p, PurposeExclude))
 	}
 	for _, hop := range s.opts.FirstHops {
 		hop = hop.Unmap()
@@ -329,9 +322,26 @@ func (s *Session) physicalRoutes(primary sysrouter.DefaultRoute) []state.Route {
 			// Excluded ranges are already off the tunnel.
 			continue
 		}
-		routes = append(routes, via(netip.PrefixFrom(hop, 32), PurposeFirstHop))
+		routes = append(routes, s.via(primary, netip.PrefixFrom(hop, 32), PurposeFirstHop))
 	}
-	return routes
+	return append(routes, s.directRoutes(primary)...)
+}
+
+// via returns a route to dst through the physical network.
+func (s *Session) via(primary sysrouter.DefaultRoute, dst netip.Prefix, purpose string) state.Route {
+	spec := sysrouter.RouteSpec{Dst: dst}
+	if primary.Gateway.IsValid() {
+		spec.Gateway = primary.Gateway
+	} else {
+		spec.Interface = primary.Interface
+	}
+	return state.Route{RouteSpec: spec, Purpose: purpose}
+}
+
+// isPhysical reports whether a route goes via the physical network, so it
+// moves when the network changes.
+func isPhysical(r state.Route) bool {
+	return r.Purpose == PurposeExclude || r.Purpose == PurposeFirstHop || r.Purpose == PurposeBypass
 }
 
 func (s *Session) excluded() []netip.Prefix {
@@ -631,7 +641,7 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 	// Move the physical routes to the new network.
 	var kept []state.Route
 	for _, route := range s.st.Routes {
-		if route.Purpose != PurposeExclude && route.Purpose != PurposeFirstHop {
+		if !isPhysical(route) {
 			kept = append(kept, route)
 			continue
 		}

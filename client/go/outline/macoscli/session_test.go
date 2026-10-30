@@ -20,14 +20,18 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"localhost/client/go/outline/configregistry"
 	"localhost/client/go/outline/macoscli/internal/fakemac"
+	"localhost/client/go/outline/macoscli/internal/ipcache"
+	"localhost/client/go/outline/macoscli/internal/rules"
 	"localhost/client/go/outline/macoscli/internal/state"
 	"localhost/client/go/outline/macoscli/internal/tunnel"
 
@@ -182,7 +186,7 @@ func TestConnect_FailedVerificationRestoresTheNetwork(t *testing.T) {
 	e, ctx := sessionEnv(t, mac)
 	e.verify = func(verifyInput) func(context.Context) error {
 		return func(context.Context) error {
-			return errors.New("check 2/3 failed: DNS at 169.254.113.53 doesn't answer")
+			return errors.New("check 2/2 failed: DNS at 169.254.113.53 doesn't answer")
 		}
 	}
 	r := runCLIContext(t, ctx, e, "connect", "--key", fakeSSKey)
@@ -269,4 +273,42 @@ func TestConnect_InvalidRulesChangeNothing(t *testing.T) {
 	require.Contains(t, r.stderr, "not a domain name")
 	require.False(t, started)
 	require.Equal(t, baseline, mac.Snapshot())
+}
+
+// fakeDirectRouter records route changes.
+type fakeDirectRouter struct {
+	routed, unrouted []string
+	err              error
+}
+
+func (f *fakeDirectRouter) RouteDirect(_ context.Context, a netip.Addr) error {
+	f.routed = append(f.routed, a.String())
+	return f.err
+}
+
+func (f *fakeDirectRouter) UnrouteDirect(_ context.Context, a netip.Addr) error {
+	f.unrouted = append(f.unrouted, a.String())
+	return f.err
+}
+
+func TestSyncDirectRoutes(t *testing.T) {
+	cache := ipcache.New(time.Minute, time.Hour, nil)
+	bypass, vpnOnly, shared, unknown := netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2"),
+		netip.MustParseAddr("192.0.2.3"), netip.MustParseAddr("192.0.2.4")
+	cache.Learn(bypass, rules.Bypass, "lichess.org", time.Hour)
+	cache.Learn(vpnOnly, rules.VPNOnly, "secret.example", time.Hour)
+	cache.Learn(shared, rules.Bypass, "cdn.example", time.Hour)
+	cache.Learn(shared, rules.VPNOnly, "secret.example", time.Hour)
+
+	var logs strings.Builder
+	log := slog.New(slog.NewTextHandler(&logs, nil))
+	r := &fakeDirectRouter{}
+	syncDirectRoutes(r, cache, []netip.Addr{bypass, vpnOnly, shared, unknown}, log)
+	require.Equal(t, []string{"192.0.2.1"}, r.routed)
+	require.Equal(t, []string{"192.0.2.2", "192.0.2.3", "192.0.2.4"}, r.unrouted, "vpn_only wins for a shared address")
+	require.Empty(t, logs.String())
+
+	r.err = errors.New("route: injected")
+	syncDirectRoutes(r, cache, []netip.Addr{bypass}, log)
+	require.Contains(t, logs.String(), "updating the direct route of an address failed")
 }

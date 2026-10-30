@@ -558,3 +558,33 @@ func TestPrefetch_RetriesFailures(t *testing.T) {
 		synctest.Wait()
 	})
 }
+
+func TestOnLearnRunsBeforeTheAnswerIsPassedOn(t *testing.T) {
+	r := testRelay(t, &fakeExchanger{answer: func(q []byte, _ bool) ([]byte, error) {
+		return dnstest.ReplyTo(q, dnstest.Options{},
+			dnstest.RR{Name: "lichess.org", Addr: "192.0.2.1", TTL: 60},
+			dnstest.RR{Name: "lichess.org", Addr: "192.0.2.1", TTL: 60}, // duplicates are passed once
+			dnstest.RR{Name: "lichess.org", Addr: "192.0.2.2", TTL: 60},
+		), nil
+	}})
+	var routed atomic.Pointer[[]netip.Addr]
+	r.OnLearn = func(addrs []netip.Addr) {
+		time.Sleep(20 * time.Millisecond) // like running "route add"
+		routed.Store(&addrs)
+	}
+	conn := r.StreamConn(dnsAddr, nil)
+	done := make(chan map[string][]byte)
+	go func() { done <- readReplies(t, conn) }()
+	_, err := conn.Write(dnstest.Frame(dnstest.Query(1, dnsmessage.TypeA, "lichess.org")))
+	require.NoError(t, err)
+	require.NoError(t, conn.CloseWrite())
+	require.Contains(t, <-done, "lichess.org")
+	got := routed.Load()
+	require.NotNil(t, got, "the routes are in place before the app sees the answer")
+	require.Equal(t, []netip.Addr{netip.MustParseAddr("192.0.2.1"), netip.MustParseAddr("192.0.2.2")}, *got)
+
+	// Answers with nothing listed don't call it.
+	routed.Store(nil)
+	r.Learn(dnstest.Response(2, "example.com", dnstest.Options{}, dnstest.RR{Name: "example.com", Addr: "192.0.2.9", TTL: 60}))
+	require.Nil(t, routed.Load())
+}
