@@ -176,3 +176,15 @@ Verified so far:
 - The direct resolvers are recomputed on every network change: the user's manual DNS if set, else the new DHCP servers from `ipconfig getpacket` (`scutil` only shows the tunnel's DNS while connected), then the gateway, then `1.1.1.1`.
 - Lookups try each resolver in turn, with a 3 s limit each.
 - Tests reproduce the hotspot case, and a fake DNS server on loopback shows the fallback to the next resolver.
+
+## 12. Manual test 4 (developer's Mac, 2026-10-30): IPv6 passes, hotspot switch still stuck
+
+**IPv6 passed:** `curl -6 https://ipv6.icanhazip.com` failed with exit 6, the same as with the stock client.
+
+**Hotspot switch:**
+- The CLI logged `the network is gone` and never `the network changed`.
+- Afterwards, the bound sockets on `en1` failed with `can't assign requested address` (no IPv4 address on `en1`) and `network is unreachable` (no route on `en1`), even for `1.1.1.1`.
+- So the new network was never configured as far as the CLI could see, and the CLI never switched to it.
+- The earlier run showed the same state for over 40 s. After Ctrl-C, which restores DNS and routes, the network works.
+- **Working hypothesis:** something in the connected state keeps macOS from finishing the new network's IPv4 setup (DHCP, or the default route).
+- **Added to find out:** while offline, the CLI now logs the default routes it sees (including scoped ones) each time they change, and how long it has been waiting.

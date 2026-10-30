@@ -135,7 +135,10 @@ type Session struct {
 	stopTransport func()
 	current       sysrouter.DefaultRoute
 	offline       bool
-	closed        bool
+	offlineSince  time.Time
+	// lastSeenDefaults is the default-route summary last logged while offline.
+	lastSeenDefaults string
+	closed           bool
 }
 
 // Up captures the current network settings, opens and configures the utun,
@@ -578,11 +581,24 @@ func (s *Session) CheckNetwork(ctx context.Context) error {
 	if !ok {
 		if !s.offline {
 			s.log.Warn("the network is gone; waiting for it to come back")
+			s.offlineSince = time.Now()
 		}
 		s.offline = true
+		// While waiting, log what the routing table shows whenever it changes,
+		// to see whether a new network appears (for example only as a scoped
+		// default route) and why it isn't picked up.
+		if seen := describeDefaults(routes); seen != s.lastSeenDefaults {
+			s.lastSeenDefaults = seen
+			s.log.Debug("waiting for a primary default route", "defaults", seen,
+				"waiting", time.Since(s.offlineSince).Round(time.Second).String())
+		}
 		return nil
 	}
+	if s.offline {
+		s.log.Info("the network is back", "after", time.Since(s.offlineSince).Round(time.Second).String(), "network", primary.String())
+	}
 	s.offline = false
+	s.lastSeenDefaults = ""
 	if primary == s.current {
 		return nil
 	}
@@ -749,4 +765,19 @@ func appendUnique(list []netip.Addr, a netip.Addr) []netip.Addr {
 		}
 	}
 	return append(list, a)
+}
+
+// describeDefaults summarizes default routes for logs, e.g. "172.20.10.1 on en1 (scoped)".
+func describeDefaults(routes []sysrouter.DefaultRoute) string {
+	if len(routes) == 0 {
+		return "none"
+	}
+	parts := make([]string, len(routes))
+	for i, r := range routes {
+		parts[i] = r.String()
+		if r.Scoped {
+			parts[i] += " (scoped)"
+		}
+	}
+	return strings.Join(parts, ", ")
 }

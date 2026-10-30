@@ -675,3 +675,27 @@ func TestNetworkChange_ManualDNSIsKept(t *testing.T) {
 	require.NoError(t, s.Down(ctx))
 	h.requireRestored(t)
 }
+
+func TestNetworkChange_LogsWhatItSeesWhileOffline(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+
+	h.mac.GoOffline()
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Equal(t, 1, strings.Count(h.logs.String(), "waiting for a primary default route"), "logged once per change")
+	require.Contains(t, h.logs.String(), "defaults=none")
+
+	// A new network shows up only as a scoped default: still offline, and logged.
+	h.mac.AlsoConnected(fakemac.Hotspot)
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Contains(t, h.logs.String(), `defaults="172.20.10.1 on en0 (scoped)"`)
+
+	h.mac.SwitchTo(fakemac.Hotspot)
+	require.NoError(t, s.CheckNetwork(ctx))
+	require.Contains(t, h.logs.String(), "the network is back")
+	require.Contains(t, h.logs.String(), "the network changed")
+	require.NoError(t, s.Down(ctx))
+}
