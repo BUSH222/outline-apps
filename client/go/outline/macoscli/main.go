@@ -95,6 +95,7 @@ type env struct {
 }
 
 func main() {
+	surviveBrokenPipes()
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
 	defer stop()
 	os.Exit(run(ctx, os.Args[1:], env{
@@ -169,4 +170,16 @@ func newLogger(w io.Writer, level string, secrets *redact.Secrets) (*slog.Logger
 	}))
 	slog.SetDefault(logger)
 	return logger, nil
+}
+
+// surviveBrokenPipes stops a closed stdout or stderr from killing the process.
+//
+// By default Go exits when it writes to a closed stdout or stderr pipe
+// (SIGPIPE). With "outline-cli connect | tee log", Ctrl-C also stops tee, and
+// the first log line written during the restore would kill the process
+// halfway. Once SIGPIPE is taken with Notify, such writes return EPIPE instead,
+// so the restore always completes. (Unlike Ignore, Notify isn't inherited by
+// the commands the CLI runs.)
+func surviveBrokenPipes() {
+	signal.Notify(make(chan os.Signal, 1), syscall.SIGPIPE)
 }

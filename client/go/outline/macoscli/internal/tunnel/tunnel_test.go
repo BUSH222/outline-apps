@@ -592,3 +592,47 @@ func TestUp_FailedVerificationRollsEverythingBack(t *testing.T) {
 	require.True(t, h.stopped.Load())
 	h.requireRestored(t)
 }
+
+// lookupFails makes route lookups for one destination fail, as on the second
+// manual test, where route -n get printed no destination line.
+type lookupFails struct {
+	*sysrouter.Router
+	dst netip.Prefix
+}
+
+func (l lookupFails) LookupRoute(ctx context.Context, dst netip.Prefix) (sysrouter.RouteStatus, error) {
+	if dst == l.dst {
+		return sysrouter.RouteAbsent, errors.New(`no destination in route output; route printed: "???"`)
+	}
+	return l.Router.LookupRoute(ctx, dst)
+}
+
+func TestUp_UnreadableRouteLookupIsNotFatal(t *testing.T) {
+	h := newHarness(t)
+	h.opts.Router = lookupFails{Router: &sysrouter.Router{Exec: h.exec}, dst: netip.MustParsePrefix("10.0.0.0/8")}
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+	require.Contains(t, h.logs.String(), "couldn't read the existing route; adding ours anyway")
+	_, ok := h.mac.HasRoute("10.0.0.0/8")
+	require.True(t, ok)
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+}
+
+func TestUp_UnreadableLookupOfSomeoneElsesRouteLeavesItAlone(t *testing.T) {
+	theirs := sysrouter.RouteSpec{Dst: netip.MustParsePrefix("10.0.0.0/8"), Interface: "en5"}
+	h := newHarness(t, func(m *fakemac.Mac) { m.AddExistingRoute(theirs) })
+	h.opts.Router = lookupFails{Router: &sysrouter.Router{Exec: h.exec}, dst: theirs.Dst}
+	ctx := context.Background()
+	s, err := Up(ctx, h.opts)
+	require.NoError(t, err)
+	for _, r := range s.State().Routes {
+		require.NotEqual(t, theirs.Dst, r.Dst, "the add failed with File exists, so it isn't recorded")
+	}
+	require.NoError(t, s.Down(ctx))
+	h.requireRestored(t)
+	got, ok := h.mac.HasRoute("10.0.0.0/8")
+	require.True(t, ok)
+	require.Equal(t, theirs, got)
+}

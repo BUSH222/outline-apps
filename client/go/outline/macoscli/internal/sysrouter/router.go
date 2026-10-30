@@ -176,7 +176,7 @@ func (r *Router) LookupRoute(ctx context.Context, dst netip.Prefix) (RouteStatus
 	}
 	res, err := parseRouteGet(out)
 	if err != nil {
-		return RouteAbsent, err
+		return RouteAbsent, fmt.Errorf("%w; route printed: %q", err, truncate(strings.TrimSpace(out), 400))
 	}
 	switch {
 	case !res.matches(dst):
@@ -290,4 +290,11 @@ func (r *Router) FlushDNSCache(ctx context.Context) error {
 	_, err1 := r.run(ctx, "dscacheutil", "-flushcache")
 	_, err2 := r.run(ctx, "killall", "-HUP", "mDNSResponder")
 	return errors.Join(err1, err2)
+}
+
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return s[:n] + "..."
 }

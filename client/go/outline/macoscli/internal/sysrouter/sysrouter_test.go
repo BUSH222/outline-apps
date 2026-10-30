@@ -464,3 +464,12 @@ func TestRouter_Reads(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, IPv6Automatic, v6.Mode)
 }
+
+func TestRouter_LookupRouteErrorShowsTheOutput(t *testing.T) {
+	r, _ := newRouter(func(sysexec.Call) ([]byte, error) {
+		return []byte("   route to: 10.0.0.0\n  something unexpected\n"), nil
+	})
+	_, err := r.LookupRoute(context.Background(), netip.MustParsePrefix("10.0.0.0/8"))
+	require.ErrorContains(t, err, "no destination in route output")
+	require.ErrorContains(t, err, "something unexpected")
+}

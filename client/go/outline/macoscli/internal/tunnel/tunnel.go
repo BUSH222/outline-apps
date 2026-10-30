@@ -351,7 +351,10 @@ func (s *Session) addRoute(ctx context.Context, route state.Route) error {
 	r := s.opts.Router
 	status, err := r.LookupRoute(ctx, route.Dst)
 	if err != nil {
-		return fmt.Errorf("checking route %s: %w", route.Dst, err)
+		// Adding anyway is safe: if a route for this destination does exist,
+		// the add fails with "File exists" and the route is left alone.
+		s.log.Warn("couldn't read the existing route; adding ours anyway", "route", route.Dst.String(), "err", err)
+		status = sysrouter.RouteAbsent
 	}
 	switch status {
 	case sysrouter.RoutePresent:
