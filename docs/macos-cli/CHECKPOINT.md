@@ -43,7 +43,7 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 - Every new file gets the Apache-2.0 header ("Copyright 2026 The Outline Authors").
 - Conventional Commits with the scope `client/macos` (commitlint `scope-enum`), ending with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
 - Never commit real keys or anything from the developer's real key or server: host names, public IPs.
-  - **This was violated once:** the developer's server IP was in `sysrouter_test.go` from commit `f3efa117` until `6e605ea4`. It is still in the pushed history.
+  - **This was violated once:** a test copied the developer's server IP from a pasted `route get` output. The branch history was rewritten and force-pushed (with the developer's approval) to remove it. Never copy values from the developer's pasted output into the repo.
   - Use documentation addresses (`192.0.2.0/24`, `198.51.100.0/24`, `203.0.113.0/24`) or obviously fake values in tests and docs.
 - Leave the upstream CI workflows alone. Ours is `.github/workflows/macos_cli.yml`.
 
@@ -72,12 +72,10 @@ The auto-mode permission check also blocked running `networksetup`/`netstat`/`sc
 | M0 Baseline, CI, findings | Done |
 | M1 CLI skeleton, key resolution, redaction, dry run | Done |
 | M2 Tunnel manager, state file, cleanup, crash safety | Done |
-| M3 Interface binding, real `connect` | **Done and confirmed on the real Mac** (manual tests 1–6: connect, both post-routing checks, disconnect, crash recovery, IPv6 leak check, a 2.4/5 GHz network switch) |
+| M3 Interface binding, real `connect` | **Done and confirmed on the real Mac** (manual tests 1–6: connect, both post-routing checks, disconnect, crash recovery, IPv6 leak check, a 2.4/5 GHz network switch, and a quick phone-hotspot switch) |
 | M4 Bypass list | **Next** |
 | M5 VPN-only list | Not started |
 | M6 Universal artifact, README, final `MANUAL_TEST.md` | Partly done (CI already produces the signed universal artifact; README not written) |
-
-Not yet re-run after the last fix: a switch to a phone hotspot (a different router). Ask for it when convenient.
 
 ## 5. How the code fits together
 
@@ -214,6 +212,9 @@ docs/macos-cli/build-local.sh                            # universal build + sig
 
 Then commit with the `client/macos` scope and run `git push origin feat/macos-cli`. Report to the developer with the outcome first; give them exact commands to run on the Mac and say what to send back.
 
-## 10. Open item for the developer
+## 10. History rewrite (done 2026-10-30)
 
-The developer's server IP is in the pushed history (commit `f3efa117`, file `client/go/outline/macoscli/internal/sysrouter/sysrouter_test.go`). It was replaced in `6e605ea4`. Removing it from the history would mean rewriting the branch and force-pushing. That is the developer's call; don't do it without explicit approval.
+The branch was rewritten with `git filter-branch` to remove the developer's server IP from a test file, and force-pushed. As a result:
+- Commit hashes from before 2026-10-30 evening, as quoted in older chat logs, no longer exist. The rewritten branch starts with the same commit messages.
+- `master` was not touched.
+- GitHub may still serve the old commits by their exact hashes until it garbage-collects them. Because the repository is a fork, that includes the upstream network. Purging them for good needs a request to GitHub Support; the developer was told.

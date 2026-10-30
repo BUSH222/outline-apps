@@ -211,4 +211,4 @@ Baseline without the VPN: about 6 s to switch.
 
 ## 14. Manual test 6 (developer's Mac, 2026-10-30): network switch recovers
 
-With commit `67f98f82`, switching between the router's 2.4 GHz and 5 GHz networks while connected recovers: the routes are re-created with the new address, and traffic flows through the tunnel again. **M3 is confirmed on the developer's Mac** for connect, checks, disconnect, crash recovery, an IPv6 leak check and a same-router network switch. A hotspot switch (different router) has not been re-run since the fix.
+With commit `bd37e0bf`, switching between the router's 2.4 GHz and 5 GHz networks while connected recovers: the routes are re-created with the new address, and traffic flows through the tunnel again. **M3 is confirmed on the developer's Mac** for connect, checks, disconnect, crash recovery, an IPv6 leak check and a same-router network switch. A later quick test with the same build showed that switching to a phone hotspot (a different router) recovers too.
