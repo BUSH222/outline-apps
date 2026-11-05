@@ -100,6 +100,9 @@ type env struct {
 	watchInterval time.Duration
 	// verify builds the check that runs once traffic is routed into the tunnel.
 	verify verifyFunc
+	// onTunnelUp, if set, is called once the tunnel is up (after the "tunnel is
+	// up" log line). It must not block; ctx ends with the session.
+	onTunnelUp func(ctx context.Context, log *slog.Logger)
 	// hostsPath and pfConfPath are the system files lockdown uses. Tests
 	// always point them at temporary files.
 	hostsPath  string
@@ -130,6 +133,7 @@ func main() {
 		interfaceIndex: netbind.InterfaceIndex,
 		openTUN:        tunnel.OpenUTun,
 		startTransport: startRemoteDevice,
+		onTunnelUp:     minimizeTerminalSoon,
 		verify:         verifyTunnel,
 		hostsPath:      lockdown.DefaultHostsPath,
 		pfConfPath:     lockdown.DefaultPFConfPath,

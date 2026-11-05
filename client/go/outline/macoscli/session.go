@@ -164,6 +164,9 @@ func runSession(ctx context.Context, e env, log *slog.Logger, pair *configregist
 		return err
 	}
 	live.Store(session)
+	if e.onTunnelUp != nil {
+		go e.onTunnelUp(ctx, log)
+	}
 	if err := lk.Connected(ctx, session.State().UTun); err != nil {
 		// Fails closed: the disconnected form still blocks the vpn_only domains.
 		log.Warn("lockdown: letting vpn_only domains through the tunnel failed, so they stay blocked", "err", err)
