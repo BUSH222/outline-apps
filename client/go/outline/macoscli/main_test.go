@@ -1,0 +1,328 @@
+// Copyright 2026 The Outline Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"bytes"
+	"context"
+	"encoding/base64"
+	"errors"
+	"io"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+
+	"localhost/client/go/outline/configregistry"
+	"localhost/client/go/outline/macoscli/internal/fakemac"
+	"localhost/client/go/outline/macoscli/internal/tunnel"
+
+	"github.com/stretchr/testify/require"
+)
+
+// Every key and secret in this file is fake. 192.0.2.0/24 is TEST-NET-1.
+var fakeSSKey = "ss://" +
+	base64.RawURLEncoding.EncodeToString([]byte("chacha20-ietf-poly1305:FAKE-static-secret")) +
+	"@192.0.2.10:8388/?outline=1#Fake%20Server"
+
+const fakeDynamicConfig = `
+transport:
+  $type: tcpudp
+  tcp:
+    $type: shadowsocks
+    endpoint: 192.0.2.20:443
+    cipher: chacha20-ietf-poly1305
+    secret: FAKE-dynamic-secret
+  udp:
+    $type: shadowsocks
+    endpoint: 192.0.2.20:443
+    cipher: chacha20-ietf-poly1305
+    secret: FAKE-dynamic-secret
+`
+
+type result struct {
+	code           int
+	stdout, stderr string
+}
+
+func runCLI(t *testing.T, e env, args ...string) result {
+	t.Helper()
+	return runCLIContext(t, context.Background(), e, args...)
+}
+
+// runCLIContext runs the CLI with fakes for everything that touches the
+// system. If e.stdout is set, output goes there too.
+func runCLIContext(t *testing.T, ctx context.Context, e env, args ...string) result {
+	t.Helper()
+	var stdout, stderr syncBuffer
+	if e.stdout != nil {
+		stdout.tee = e.stdout
+	}
+	e.stdout, e.stderr = &stdout, &stderr
+	if e.bind == nil {
+		// Refuse every transport socket: tests never use the real network.
+		e.bind = func(uintptr, string, int) error { return errors.New("test: no real sockets") }
+	}
+	if e.interfaceIndex == nil {
+		e.interfaceIndex = func(name string) (int, error) {
+			if name == "en0" || name == "en7" {
+				return 6, nil
+			}
+			return 0, errors.New("no such interface")
+		}
+	}
+	if e.openTUN == nil {
+		e.openTUN = func() (tunnel.TUN, error) { return placeholderTUN{}, nil }
+	}
+	if e.verify == nil {
+		e.verify = func(verifyInput) func(context.Context) error {
+			return func(context.Context) error { return nil }
+		}
+	}
+	if e.startTransport == nil {
+		e.startTransport = func(context.Context, tunnel.TUN, *configregistry.TransportPair, *slog.Logger) (func(), error) {
+			return func() {}, nil
+		}
+	}
+	if e.getenv == nil {
+		home := t.TempDir()
+		e.getenv = func(k string) string {
+			if k == "HOME" {
+				return home
+			}
+			return ""
+		}
+	}
+	if e.executable == nil {
+		// The default key and rules files go next to a program in a temporary directory.
+		exe := filepath.Join(t.TempDir(), "outline-cli")
+		e.executable = func() (string, error) { return exe, nil }
+	}
+	if e.elevate == nil {
+		// Tests never run the real sudo.
+		e.elevate = func([]string) error { return errors.New("test: no sudo") }
+	}
+	// Tests never run real system commands.
+	if e.exec == nil {
+		e.exec = fakemac.New().Executor()
+	}
+	if e.stateDir == "" {
+		e.stateDir = t.TempDir()
+	}
+	// Tests never touch the real /etc/hosts or /etc/pf.conf.
+	if e.hostsPath == "" {
+		e.hostsPath = testHostsFile(t)
+	}
+	if e.pfConfPath == "" {
+		e.pfConfPath = filepath.Join(t.TempDir(), "pf.conf")
+		require.NoError(t, os.WriteFile(e.pfConfPath, []byte("anchor \"com.apple/*\"\n"), 0o644))
+	}
+	if e.geteuid == nil {
+		e.geteuid = func() int { return 501 }
+	}
+	if e.localPrefixes == nil {
+		e.localPrefixes = func() ([]netip.Prefix, error) { return nil, nil }
+	}
+	if e.lookup == nil {
+		e.lookup = func(context.Context, string) ([]netip.Addr, error) { return nil, errors.New("no DNS in tests") }
+	}
+	code := run(ctx, args, e)
+	return result{code, stdout.String(), stderr.String()}
+}
+
+// syncBuffer is a goroutine-safe buffer that can copy writes to tee.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+	tee io.Writer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.tee != nil {
+		b.tee.Write(p)
+	}
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// testHostsContent is the hosts file tests start with.
+const testHostsContent = "127.0.0.1\tlocalhost\n::1\tlocalhost\n"
+
+func testHostsFile(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "hosts")
+	require.NoError(t, os.WriteFile(path, []byte(testHostsContent), 0o644))
+	return path
+}
+
+func requireNoSecrets(t *testing.T, r result) {
+	t.Helper()
+	for _, out := range []string{r.stdout, r.stderr} {
+		require.NotContains(t, out, "FAKE", "output leaks a secret:\n%s", out)
+	}
+}
+
+func TestVersion(t *testing.T) {
+	r := runCLI(t, env{}, "version")
+	require.Equal(t, exitOK, r.code)
+	require.Equal(t, version+"\n", r.stdout)
+}
+
+func TestUsage(t *testing.T) {
+	r := runCLI(t, env{}, "bogus")
+	require.Equal(t, exitUsage, r.code)
+	require.Contains(t, r.stderr, `unknown command "bogus"`)
+	require.Equal(t, exitOK, runCLI(t, env{}, "help").code)
+	require.Equal(t, exitOK, runCLI(t, env{}, "connect", "-h").code)
+	require.Equal(t, exitUsage, runCLI(t, env{}, "connect", "--dry-run", "extra").code)
+	require.Equal(t, exitUsage, runCLI(t, env{}, "connect", "--log-level", "loud").code)
+}
+
+func TestConnectWithoutRootChangesNothing(t *testing.T) {
+	fetched := false
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { fetched = true }))
+	defer server.Close()
+	r := runCLI(t, env{httpTransport: server.Client().Transport}, "connect", "--key", server.URL+"/FAKE")
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "must run as root")
+	require.False(t, fetched, "connect must refuse before fetching the key")
+}
+
+func TestDryRun_StaticKey(t *testing.T) {
+	dir := t.TempDir()
+	keyFile := filepath.Join(dir, "key")
+	require.NoError(t, os.WriteFile(keyFile, []byte(fakeSSKey+"\n"), 0o600))
+
+	r := runCLI(t, env{}, "connect", "--dry-run", "--key-file", keyFile)
+	require.Equal(t, exitOK, r.code, r.stderr)
+	require.Contains(t, r.stdout, "nothing will be changed")
+	require.Contains(t, r.stdout, "key:             static, ss://<redacted>@192.0.2.10:8388/<redacted> (from --key-file)")
+	require.Contains(t, r.stdout, "transport:       shadowsocks (URL)")
+	require.Contains(t, r.stdout, "connection type: tunneled (TCP tunneled, UDP tunneled)")
+	require.Contains(t, r.stdout, "first hop:       192.0.2.10:8388")
+	require.Contains(t, r.stdout, "not found: running without rules")
+	require.Empty(t, r.stderr)
+	requireNoSecrets(t, r)
+}
+
+func TestDryRun_DynamicKey(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		require.Equal(t, "/FAKE-path-token", r.URL.Path)
+		w.Write([]byte(fakeDynamicConfig))
+	}))
+	defer server.Close()
+	key := "ssconf://" + strings.TrimPrefix(server.URL, "https://") + "/FAKE-path-token?k=FAKE-query#Name"
+	getenv := func(k string) string {
+		switch k {
+		case "OUTLINE_KEY":
+			return key
+		case "HOME":
+			return "/nonexistent-home"
+		}
+		return ""
+	}
+
+	r := runCLI(t, env{getenv: getenv, httpTransport: server.Client().Transport}, "connect", "--dry-run")
+	require.Equal(t, exitOK, r.code, r.stderr)
+	hostPort := strings.TrimPrefix(server.URL, "https://")
+	require.Contains(t, r.stdout, "key:             dynamic, ssconf://"+hostPort+"/<redacted> (from OUTLINE_KEY)")
+	require.Contains(t, r.stdout, "transport:       tcpudp")
+	require.Contains(t, r.stdout, "connection type: tunneled (TCP tunneled, UDP tunneled)")
+	require.Contains(t, r.stdout, "first hop:       192.0.2.20:443")
+	requireNoSecrets(t, r)
+}
+
+func TestDryRun_FetchErrorIsRedacted(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "gone", http.StatusNotFound)
+	}))
+	defer server.Close()
+	r := runCLI(t, env{httpTransport: server.Client().Transport},
+		"connect", "--dry-run", "--key", server.URL+"/FAKE-path?k=FAKE-query")
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "404 Not Found")
+	requireNoSecrets(t, r)
+}
+
+func TestDryRun_RefusesLoopingConfig(t *testing.T) {
+	dir := t.TempDir()
+	cfg := filepath.Join(dir, "basic.yaml")
+	require.NoError(t, os.WriteFile(cfg, []byte("transport:\n  $type: basic-access\n"), 0o600))
+	r := runCLI(t, env{}, "connect", "--dry-run", "--key", cfg)
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "loop back into the tunnel")
+}
+
+func TestDryRun_InvalidStaticKeyIsRedacted(t *testing.T) {
+	r := runCLI(t, env{}, "connect", "--dry-run", "--key", "ss://FAKE-garbage-userinfo@192.0.2.10:8388")
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "invalid tunnel config")
+	requireNoSecrets(t, r)
+}
+
+func TestDryRun_ExplicitRulesFileMustExist(t *testing.T) {
+	r := runCLI(t, env{}, "connect", "--dry-run", "--key", fakeSSKey, "--rules", "/nonexistent/rules.yaml")
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "rules file")
+
+	rules := filepath.Join(t.TempDir(), "rules.yaml")
+	require.NoError(t, os.WriteFile(rules, []byte("bypass: []\n"), 0o644))
+	r = runCLI(t, env{}, "connect", "--dry-run", "--key", fakeSSKey, "--rules", rules)
+	require.Equal(t, exitOK, r.code, r.stderr)
+	require.Contains(t, r.stdout, rules+" (--rules; found")
+	// --key warns about shell history.
+	require.Contains(t, r.stderr, "prefer --key-file")
+	requireNoSecrets(t, r)
+}
+
+func TestDryRun_ShowsTheRules(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.yaml")
+	require.NoError(t, os.WriteFile(path, []byte(`
+bypass: [Lichess.org, "*.cdn.example", private.secret.example]
+vpn_only: [secret.example]
+min_ttl: 30s
+`), 0o644))
+	r := runCLI(t, env{}, "connect", "--dry-run", "--key", fakeSSKey, "--rules", path)
+	require.Equal(t, exitOK, r.code, r.stderr)
+	require.Contains(t, r.stdout, "found: 3 bypass, 1 vpn_only")
+	require.Contains(t, r.stdout, "bypass:          lichess.org, *.cdn.example, private.secret.example\n")
+	require.Contains(t, r.stdout, "vpn_only:        secret.example (")
+	require.Contains(t, r.stdout, "learned TTL:     30s to 1h0m0s")
+	require.Contains(t, r.stderr, `private.secret.example\" is covered by vpn_only entry`)
+
+	require.NoError(t, os.WriteFile(path, []byte("bypass: [lichess.org]\nmin_tl: 30s\n"), 0o644))
+	r = runCLI(t, env{}, "connect", "--dry-run", "--key", fakeSSKey, "--rules", path)
+	require.Equal(t, exitError, r.code)
+	require.Contains(t, r.stderr, "min_tl")
+}
+
+func TestResolveRulesPath(t *testing.T) {
+	require.Equal(t, rulesLocation{Path: "/etc/rules.yaml", Explicit: true, Origin: "--rules"},
+		resolveRulesPath("/etc/rules.yaml", "/Applications/outline"))
+	require.Equal(t, rulesLocation{Path: "/Applications/outline/rules.yaml", Origin: "next to the program"},
+		resolveRulesPath("", "/Applications/outline"))
+}

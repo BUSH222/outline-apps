@@ -1,0 +1,355 @@
+// Copyright 2026 The Outline Authors
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//      http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+package main
+
+import (
+	"context"
+	"errors"
+	"flag"
+	"fmt"
+	"io"
+	"io/fs"
+	"log/slog"
+	"net/netip"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"localhost/client/go/configyaml"
+	"localhost/client/go/outline/configregistry"
+	"localhost/client/go/outline/macoscli/internal/keys"
+	"localhost/client/go/outline/macoscli/internal/netbind"
+	"localhost/client/go/outline/macoscli/internal/redact"
+	"localhost/client/go/outline/macoscli/internal/rules"
+	"localhost/client/go/outline/macoscli/internal/state"
+	"localhost/client/go/outline/macoscli/internal/sysexec"
+	"localhost/client/go/outline/macoscli/internal/sysrouter"
+	"localhost/client/go/outline/macoscli/internal/tunnel"
+)
+
+type connectFlags struct {
+	key      string
+	keyFile  string
+	rules    string
+	logLevel string
+	dryRun   bool
+}
+
+func runConnect(ctx context.Context, args []string, e env) int {
+	var f connectFlags
+	flags := flag.NewFlagSet("connect", flag.ContinueOnError)
+	flags.SetOutput(e.stderr)
+	flags.StringVar(&f.key, "key", "", "access key (ss://, ssconf://, https://) or config file path; lands in shell history, prefer --key-file")
+	flags.StringVar(&f.keyFile, "key-file", "", "file holding the access key (default: "+defaultKeyName+" next to the program)")
+	flags.StringVar(&f.rules, "rules", "", "rules file (default: "+defaultRulesName+" next to the program)")
+	flags.StringVar(&f.logLevel, "log-level", "info", "log level: debug, info, warn or error")
+	flags.BoolVar(&f.dryRun, "dry-run", false, "resolve the key and print the plan; change nothing (no root needed)")
+	if err := flags.Parse(args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return exitOK
+		}
+		return exitUsage
+	}
+	if flags.NArg() > 0 {
+		fmt.Fprintf(e.stderr, "outline-cli connect: unexpected arguments: %s\n", strings.Join(flags.Args(), " "))
+		return exitUsage
+	}
+
+	secrets := &redact.Secrets{}
+	logger, err := newLogger(e.stderr, f.logLevel, secrets)
+	if err != nil {
+		fmt.Fprintf(e.stderr, "outline-cli connect: %v\n", err)
+		return exitUsage
+	}
+	fail := func(err error) int {
+		fmt.Fprintf(e.stderr, "outline-cli connect: %s\n", secrets.Error(err))
+		return exitError
+	}
+
+	if !f.dryRun {
+		// Before reading the key: a dynamic key is fetched directly, which
+		// needs a working network, not one left pointing at a dead tunnel.
+		unlock, err := prepareSession(ctx, e, logger)
+		if err != nil {
+			return fail(err)
+		}
+		defer unlock()
+	}
+
+	// Without a key or rules given, both files sit next to the program. A
+	// real connect creates them if they are missing.
+	dir, err := exeDir(e)
+	if err != nil {
+		return fail(err)
+	}
+	defaultKey := f.key == "" && f.keyFile == "" && strings.TrimSpace(e.getenv(keys.EnvKey)) == ""
+	if defaultKey {
+		f.keyFile = filepath.Join(dir, defaultKeyName)
+	}
+	rulesLoc := resolveRulesPath(f.rules, dir)
+	if !f.dryRun {
+		if err := createDefaultFiles(e, defaultKey, f.keyFile, rulesLoc); err != nil {
+			return fail(err)
+		}
+	}
+	if defaultKey {
+		if err := checkDefaultKeyFile(f.keyFile); err != nil {
+			return fail(err)
+		}
+	}
+
+	raw, err := keys.Read(keys.Input{Key: f.key, KeyFile: f.keyFile, Getenv: e.getenv})
+	if err != nil {
+		return fail(err)
+	}
+	for _, w := range raw.Warnings {
+		logger.Warn(w)
+	}
+	resolver := &keys.Resolver{
+		Fetcher: &keys.Fetcher{Transport: e.httpTransport},
+		Secrets: secrets,
+	}
+	resolved, err := resolver.Resolve(ctx, raw)
+	if err != nil {
+		return fail(err)
+	}
+	// A real connect builds the transport on interface-bound sockets. The dry
+	// run only inspects the config, so plain dialers are fine (parsing does no
+	// network I/O).
+	binder := netbind.NewWith(e.bind, e.interfaceIndex)
+	var provider *configyaml.TypeParser[*configregistry.TransportPair]
+	if !f.dryRun {
+		provider = configregistry.NewDefaultTransportProvider(binder.StreamDialer(), binder.PacketDialer())
+	}
+	parsed, err := keys.ParseClientConfig(ctx, resolved.ClientConfig, provider)
+	if err != nil {
+		return fail(err)
+	}
+	if err := keys.CheckLoopSafe(parsed.Pair); err != nil {
+		return fail(err)
+	}
+	if parsed.HasReporter {
+		logger.Warn("this key includes a usage reporter, which outline-cli does not run")
+	}
+	domainRules, rulesStatus, err := loadRules(rulesLoc)
+	if err != nil {
+		return fail(err)
+	}
+	for _, w := range domainRules.Warnings {
+		logger.Warn("rules file: " + w)
+	}
+	if err := checkVPNOnlyTransport(parsed.Pair, domainRules); err != nil {
+		return fail(err)
+	}
+	hops, hopsByName, err := firstHopAddrs(ctx, parsed.Pair, e.lookup)
+	if err != nil {
+		return fail(err)
+	}
+	binder.SetKnownAddrs(hopsByName)
+
+	if !f.dryRun {
+		logger.Info("connecting", "key", resolved.Display, "transport", parsed.TransportType,
+			"rules", rulesLoc.Path+" ("+rulesStatus+")")
+		if err := runSession(ctx, e, logger, parsed.Pair, binder, hops, domainRules); err != nil {
+			return fail(err)
+		}
+		return exitOK
+	}
+
+	// Every line goes through the redactor as a last guard.
+	out := &redactingWriter{w: e.stdout, secrets: secrets}
+	printDryRun(out, raw, resolved, parsed, rulesLoc, rulesStatus, hops)
+	printRules(out, domainRules)
+	fmt.Fprintf(out, "  state file:      %s\n", describeStateFile(state.FileStore{Dir: e.stateDir}))
+	if err := printPlan(ctx, out, e, hops, logger); err != nil {
+		return fail(err)
+	}
+	return exitOK
+}
+
+// printPlan runs the connect and disconnect sequences against the dry-run
+// executor: read-only queries run for real, every change is only printed.
+func printPlan(ctx context.Context, out io.Writer, e env, hops []netip.Addr, logger *slog.Logger) error {
+	dry := &sysexec.DryRun{Next: e.exec, IsReadOnly: sysrouter.IsReadOnly, Out: out}
+	opts := tunnel.Options{
+		Router:  &sysrouter.Router{Exec: dry},
+		Store:   state.NewMemStore(nil),
+		OpenTUN: func() (tunnel.TUN, error) { return placeholderTUN{}, nil },
+		StartTransport: func(context.Context, tunnel.TUN) (func(), error) {
+			return func() {}, nil
+		},
+		FirstHops:     hops,
+		LocalPrefixes: e.localPrefixes,
+		// Only warnings are relevant in a dry run; "tunnel is up" would mislead.
+		Logger: slog.New(warnOnly{logger.Handler()}),
+	}
+	fmt.Fprintln(out, "  connect would run (utunN is the utun macOS assigns):")
+	session, err := tunnel.Up(ctx, opts)
+	if err != nil {
+		return fmt.Errorf("planning the connection: %w", err)
+	}
+	fmt.Fprintln(out, "  disconnect would run:")
+	return session.Down(ctx)
+}
+
+// placeholderTUN stands in for the utun in a dry run.
+type placeholderTUN struct{}
+
+func (placeholderTUN) Read([]byte) (int, error)    { return 0, io.EOF }
+func (placeholderTUN) Write(p []byte) (int, error) { return len(p), nil }
+func (placeholderTUN) Close() error                { return nil }
+func (placeholderTUN) Name() string                { return "utunN" }
+
+// warnOnly drops records below Warn.
+type warnOnly struct{ slog.Handler }
+
+func (w warnOnly) Enabled(ctx context.Context, l slog.Level) bool {
+	return l >= slog.LevelWarn && w.Handler.Enabled(ctx, l)
+}
+
+// describeStateFile reports whether a previous session left state behind.
+func describeStateFile(store state.FileStore) string {
+	st, err := store.Load()
+	switch {
+	case errors.Is(err, fs.ErrPermission):
+		return store.Path() + " (only readable by root; check with: sudo outline-cli cleanup --dry-run)"
+	case err != nil:
+		return fmt.Sprintf("%s (unreadable: %v)", store.Path(), err)
+	case st == nil:
+		return store.Path() + " (none; nothing to recover)"
+	default:
+		return fmt.Sprintf("%s (left by a session started %s; a real connect restores it first)",
+			store.Path(), st.StartedAt.Local().Format(time.DateTime))
+	}
+}
+
+func printDryRun(w io.Writer, raw *keys.RawKey, resolved *keys.Resolved, parsed *keys.Parsed, loc rulesLocation, rulesStatus string, hops []netip.Addr) {
+	pair := parsed.Pair
+	firstHop := resolved.FirstHop
+	if firstHop == "" {
+		firstHop = fmt.Sprintf("differs: TCP %s, UDP %s", orNone(pair.StreamDialer.FirstHop), orNone(pair.PacketRelay.FirstHop))
+	}
+	reporter := "none"
+	if parsed.HasReporter {
+		reporter = "present (not used by the CLI yet)"
+	}
+
+	fmt.Fprintln(w, "outline-cli connect --dry-run: nothing will be changed")
+	fmt.Fprintf(w, "  key:             %s, %s (from %s)\n", resolved.Kind, resolved.Display, raw.Source)
+	fmt.Fprintf(w, "  transport:       %s\n", parsed.TransportType)
+	fmt.Fprintf(w, "  connection type: %s (TCP %s, UDP %s)\n", resolved.ConnectionType,
+		keys.ConnTypeName(pair.StreamDialer.ConnType), keys.ConnTypeName(pair.PacketRelay.ConnType))
+	fmt.Fprintf(w, "  first hop:       %s\n", firstHop)
+	hopIPs := make([]string, len(hops))
+	for i, h := range hops {
+		hopIPs[i] = h.String()
+	}
+	fmt.Fprintf(w, "  first hop IPs:   %s\n", orNone(strings.Join(hopIPs, ", ")))
+	fmt.Fprintf(w, "  usage reporter:  %s\n", reporter)
+	fmt.Fprintf(w, "  rules file:      %s (%s; %s)\n", loc.Path, loc.Origin, rulesStatus)
+}
+
+func orNone(s string) string {
+	if s == "" {
+		return "none"
+	}
+	return s
+}
+
+// createDefaultFiles creates the default key file (empty, mode 0600) and
+// rules file (comments only) if they are missing, owned by the user who ran
+// sudo, and says so.
+func createDefaultFiles(e env, defaultKey bool, keyFile string, rulesLoc rulesLocation) error {
+	if defaultKey {
+		created, err := ensureFile(e, keyFile, nil, 0o600)
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Fprintf(e.stdout, "created %s: paste your access key into it\n", keyFile)
+		}
+	}
+	if !rulesLoc.Explicit {
+		created, err := ensureFile(e, rulesLoc.Path, []byte(rulesTemplate), 0o644)
+		if err != nil {
+			return err
+		}
+		if created {
+			fmt.Fprintf(e.stdout, "created %s: domain rules (none yet)\n", rulesLoc.Path)
+		}
+	}
+	return nil
+}
+
+// checkDefaultKeyFile explains what to do when the default key file is
+// missing (a dry run doesn't create it) or still empty.
+func checkDefaultKeyFile(path string) error {
+	data, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("no access key: put it in %s (connect creates the file), or pass --key-file PATH", path)
+	}
+	if err != nil {
+		return fmt.Errorf("reading the key file: %w", err)
+	}
+	if strings.TrimSpace(string(data)) == "" {
+		return fmt.Errorf("no access key yet: paste your Outline access key into %s, save it, and start outline-cli again", path)
+	}
+	return nil
+}
+
+// checkVPNOnlyTransport refuses vpn_only rules with a transport that sends
+// some traffic directly (for example an iptable with direct entries): those
+// domains must only ever go through the tunnel (decision D8).
+func checkVPNOnlyTransport(pair *configregistry.TransportPair, r *rules.Rules) error {
+	if len(r.VPNOnly) == 0 {
+		return nil
+	}
+	tcp, udp := pair.StreamDialer.ConnType, pair.PacketRelay.ConnType
+	if tcp == configregistry.ConnTypeTunneled && udp == configregistry.ConnTypeTunneled {
+		return nil
+	}
+	return fmt.Errorf("the rules file has vpn_only entries, but this key's transport doesn't send everything through the server (TCP %s, UDP %s); remove the vpn_only entries or use a key that tunnels everything",
+		keys.ConnTypeName(tcp), keys.ConnTypeName(udp))
+}
+
+// printRules shows the domain rules a real connect would apply.
+func printRules(w io.Writer, r *rules.Rules) {
+	if r.IsEmpty() {
+		return
+	}
+	fmt.Fprintf(w, "  bypass:          %s\n", orNone(strings.Join(r.Bypass, ", ")))
+	fmt.Fprintf(w, "  vpn_only:        %s (only through the tunnel; blocked while disconnected after: sudo outline-cli lockdown)\n",
+		orNone(strings.Join(r.VPNOnly, ", ")))
+	direct := "the network's own (DHCP or as set on the service)"
+	if len(r.DirectDNS) > 0 {
+		direct = fmt.Sprint(r.DirectDNS)
+	}
+	fmt.Fprintf(w, "  bypass DNS:      %s\n", direct)
+	fmt.Fprintf(w, "  learned TTL:     %s to %s\n", r.MinTTL, r.MaxTTL)
+}
+
+// redactingWriter redacts everything written through it.
+type redactingWriter struct {
+	w       io.Writer
+	secrets *redact.Secrets
+}
+
+func (r *redactingWriter) Write(p []byte) (int, error) {
+	if _, err := io.WriteString(r.w, r.secrets.Redact(string(p))); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
