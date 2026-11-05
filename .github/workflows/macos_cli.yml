@@ -160,3 +160,47 @@ jobs:
             output/macos-cli/${{ env.NAME }}.sha256
           if-no-files-found: error
           retention-days: 30
+
+  release:
+    # Moves the universal binary to the rolling "latest" release: the release
+    # and its tag are deleted and recreated at this commit, so the tag always
+    # points at the source the binary was built from. Runs for pushes to master
+    # and for manual runs; other branch pushes only produce workflow artifacts.
+    name: Publish latest release
+    needs: universal
+    if: github.ref == 'refs/heads/master' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    concurrency:
+      # Never cancel a half-finished delete/create; queue instead.
+      group: macos-cli-release
+      cancel-in-progress: false
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Download universal binary
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ env.NAME }}-macos-universal
+          path: release
+
+      - name: Replace the latest release
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          # Artifacts do not keep the executable bit.
+          chmod +x "release/$NAME"
+          ls -l release
+
+          # Remove the old release and its tag, if any, so the tag can move.
+          gh release delete latest --cleanup-tag --yes || true
+
+          gh release create latest \
+            --target "$SHA" \
+            --title latest \
+            --notes "Rolling build of the macOS CLI (universal arm64 + x86_64, ad hoc signed) from commit $SHA." \
+            "release/$NAME" \
+            "release/$NAME.sha256"
